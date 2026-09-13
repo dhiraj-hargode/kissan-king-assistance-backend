@@ -1,0 +1,25 @@
+{
+  "name": "kissan-king-assistance-backend",
+  "version": "1.0.0",
+  "description": "",
+  "main": "server.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node server.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dhiraj-hargode/kissan-king-assistance-backend.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/dhiraj-hargode/kissan-king-assistance-backend/issues"
+  },
+  "homepage": "https://github.com/dhiraj-hargode/kissan-king-assistance-backend#readme",
+  "dependencies": {
+    "pg": "^8.23.0"
+  }
+}

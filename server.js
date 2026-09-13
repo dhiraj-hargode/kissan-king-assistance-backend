@@ -480,7 +480,7 @@ async function setSession(res, userId, remember) {
 
   res.setHeader(
     'Set-Cookie',
-    `kk_session=${encodeURIComponent(raw)}; HttpOnly; Path=/; SameSite=${IS_PROD ? 'None' : 'Lax'}; Max-Age=${days * 86400}${IS_PROD ? '; Secure' : ''}`
+    `kk_session=${encodeURIComponent(raw)}; HttpOnly; Path=/; SameSite=None; Max-Age=${days * 86400}${IS_PROD ? '; Secure' : ''}`
   );
 }
 
@@ -492,7 +492,7 @@ async function clearSession(req, res) {
   }
   res.setHeader(
     'Set-Cookie',
-    `kk_session=; HttpOnly; Path=/; SameSite=Lax; Max-Age=0${IS_PROD ? '; Secure' : ''}`
+    `kk_session=; HttpOnly; Path=/; SameSite=None; Max-Age=0${IS_PROD ? '; Secure' : ''}`
   );
 }
 

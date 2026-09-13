@@ -116,7 +116,9 @@ function integrity(data) {
     cs.add(id);
     if (!String(c.firstName || '').trim()) e.push('Customer ' + id + ' has no first name');
     if (!mobileOk(c.mobile, true)) e.push('Customer ' + id + ' has invalid mobile');
-    if (!String(c.village || '').trim()) e.push('Customer ' + id + ' has no village');
+    if (!String(c.city || '').trim()) {
+      e.push('Customer ' + id + ' has no city');
+    }
     if (!String(c.district || '').trim()) e.push('Customer ' + id + ' has no district');
     const m = String(c.mobile || '');
     if ([...data.customers].filter(x => String(x.mobile || '') === m).length > 1) {
@@ -666,7 +668,7 @@ async function importExcelPayload(base64, mode = 'add') {
       middleName: parts.length > 2 ? parts.slice(1, -1).join(' ') : '',
       lastName: parts.length > 1 ? parts[parts.length - 1] : '',
       mobile,
-      village: excelText(pick(r, ['Village'])),
+      city: excelText(pick(r, ['City'])),
       district: excelText(pick(r, ['District'])),
       address: excelText(pick(r, ['Address'])),
       homeNumber: '',
@@ -678,7 +680,7 @@ async function importExcelPayload(base64, mode = 'add') {
       createdAt: new Date().toISOString()
     };
 
-    if (!next.village) issues.push(`Customer row ${rowNo}: Village is required.`);
+    if (!next.city) issues.push(`Customer row ${rowNo}: City is required.`);
     if (!next.district) issues.push(`Customer row ${rowNo}: District is required.`);
     if (!/^\d{10}$/.test(mobile)) issues.push(`Customer row ${rowNo}: Mobile must be 10 digits.`);
 
@@ -970,7 +972,7 @@ async function api(req, res) {
       }
 
       if (!name || !/^[a-z0-9._-]{3,30}$/.test(username) || (mobile && !mobileOk(mobile)) ||
-          !ROLES.includes(role) || password.length < 8 || !/[A-Za-z]/.test(password) || !/[0-9]/.test(password)) {
+        !ROLES.includes(role) || password.length < 8 || !/[A-Za-z]/.test(password) || !/[0-9]/.test(password)) {
         return send(res, 400, { error: 'Invalid registration details' });
       }
 
@@ -1168,7 +1170,7 @@ async function createBackup() {
 }
 
 const server = http.createServer(async (req, res) => {
-    corsHeaders(req, res);
+  corsHeaders(req, res);
 
   if (req.method === 'OPTIONS') {
     res.statusCode = 204;
@@ -1216,7 +1218,7 @@ async function start() {
     });
   } catch (e) {
     console.error('Failed to start application:', e.message);
-    await db.end().catch(() => {});
+    await db.end().catch(() => { });
     process.exit(1);
   }
 }

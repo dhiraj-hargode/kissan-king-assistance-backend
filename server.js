@@ -478,7 +478,7 @@ async function setSession(res, userId, remember) {
 
   res.setHeader(
     'Set-Cookie',
-    `kk_session=${encodeURIComponent(raw)}; HttpOnly; Path=/; SameSite=Lax; Max-Age=${days * 86400}${IS_PROD ? '; Secure' : ''}`
+    `kk_session=${encodeURIComponent(raw)}; HttpOnly; Path=/; SameSite=${IS_PROD ? 'None' : 'Lax'}; Max-Age=${days * 86400}${IS_PROD ? '; Secure' : ''}`
   );
 }
 
@@ -515,6 +515,26 @@ function securityHeaders(res) {
   res.setHeader('Referrer-Policy', 'same-origin');
   res.setHeader('Permissions-Policy', 'geolocation=(),camera=(),microphone=()');
   if (IS_PROD) res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+}
+
+const ALLOWED_ORIGINS = new Set([
+  'http://localhost:5500',
+  'http://127.0.0.1:5500'
+]);
+
+function corsHeaders(req, res) {
+  const origin = req.headers.origin;
+
+  if (origin && ALLOWED_ORIGINS.has(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Vary', 'Origin');
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
+    res.setHeader(
+      'Access-Control-Allow-Headers',
+      'Content-Type, X-Requested-With'
+    );
+  }
 }
 
 function send(res, status, body, headers = {}) {
@@ -1148,6 +1168,13 @@ async function createBackup() {
 }
 
 const server = http.createServer(async (req, res) => {
+    corsHeaders(req, res);
+
+  if (req.method === 'OPTIONS') {
+    res.statusCode = 204;
+    res.end();
+    return;
+  }
   try {
     if (String(req.url).startsWith('/api/')) {
       await api(req, res);

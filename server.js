@@ -521,7 +521,8 @@ function securityHeaders(res) {
 
 const ALLOWED_ORIGINS = new Set([
   'http://localhost:5500',
-  'http://127.0.0.1:5500'
+  'http://127.0.0.1:5500',
+  "https://kissan-king-assistance-frontend.onrender.com"
 ]);
 
 function corsHeaders(req, res) {

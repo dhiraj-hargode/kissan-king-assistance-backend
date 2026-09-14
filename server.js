@@ -267,6 +267,90 @@ async function initDb() {
     )
   `);
 
+  // Phase 3 normalized business tables. These are a shadow copy initially:
+  // existing JSONB APIs remain the source of truth until each API is migrated.
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS customers (
+      id TEXT PRIMARY KEY,
+      first_name TEXT, middle_name TEXT, last_name TEXT, name TEXT,
+      mobile TEXT, alternate_mobile TEXT, reference TEXT, address TEXT,
+      city TEXT, district TEXT, pincode TEXT, status TEXT,
+      created_at TIMESTAMPTZ, updated_at TIMESTAMPTZ, data_json JSONB NOT NULL DEFAULT '{}'::jsonb
+    )
+  `);
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS loans (
+      id TEXT PRIMARY KEY,
+      customer_id TEXT NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+      khata_no TEXT, loan_type TEXT, loan_against TEXT,
+      amount NUMERIC(18,2) NOT NULL DEFAULT 0, rate NUMERIC(10,4) DEFAULT 0,
+      emi NUMERIC(18,2) DEFAULT 0, emi_option TEXT, start_date DATE,
+      status TEXT, created_at TIMESTAMPTZ, updated_at TIMESTAMPTZ, data_json JSONB NOT NULL DEFAULT '{}'::jsonb
+    )
+  `);
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS schedules (
+      id TEXT PRIMARY KEY,
+      loan_id TEXT NOT NULL REFERENCES loans(id) ON DELETE CASCADE,
+      due_date DATE, installment_no INTEGER, emi NUMERIC(18,2) DEFAULT 0,
+      principal NUMERIC(18,2) DEFAULT 0, interest NUMERIC(18,2) DEFAULT 0,
+      penalty NUMERIC(18,2) DEFAULT 0, paid NUMERIC(18,2) DEFAULT 0,
+      remaining NUMERIC(18,2) DEFAULT 0, status TEXT, manual_pending BOOLEAN DEFAULT FALSE,
+      pending_added_at TIMESTAMPTZ, pending_added_by TEXT, data_json JSONB NOT NULL DEFAULT '{}'::jsonb
+    )
+  `);
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS payments (
+      id TEXT PRIMARY KEY,
+      loan_id TEXT NOT NULL REFERENCES loans(id) ON DELETE CASCADE,
+      schedule_id TEXT REFERENCES schedules(id) ON DELETE SET NULL,
+      payment_date DATE, principal NUMERIC(18,2) DEFAULT 0,
+      interest NUMERIC(18,2) DEFAULT 0, penalty NUMERIC(18,2) DEFAULT 0,
+      total NUMERIC(18,2) DEFAULT 0, mode TEXT, notes TEXT,
+      created_at TIMESTAMPTZ, activity_created_at TIMESTAMPTZ, data_json JSONB NOT NULL DEFAULT '{}'::jsonb
+    )
+  `);
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS blacklist (
+      id TEXT PRIMARY KEY, customer_id TEXT NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+      reason TEXT, blacklist_date DATE, notes TEXT, outstanding NUMERIC(18,2) DEFAULT 0,
+      created_at TIMESTAMPTZ, data_json JSONB NOT NULL DEFAULT '{}'::jsonb
+    )
+  `);
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS notifications (
+      id TEXT PRIMARY KEY, customer_id TEXT REFERENCES customers(id) ON DELETE CASCADE,
+      type TEXT, title TEXT, message TEXT, read BOOLEAN DEFAULT FALSE,
+      created_at TIMESTAMPTZ, data_json JSONB NOT NULL DEFAULT '{}'::jsonb
+    )
+  `);
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS deleted_records (
+      id TEXT PRIMARY KEY, record_type TEXT, record_id TEXT,
+      deleted_at TIMESTAMPTZ, deleted_by TEXT, data_json JSONB NOT NULL DEFAULT '{}'::jsonb
+    )
+  `);
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS expired_customers (
+      id TEXT PRIMARY KEY, customer_id TEXT NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+      reason TEXT, expired_date DATE, notes TEXT, data_json JSONB NOT NULL DEFAULT '{}'::jsonb
+    )
+  `);
+
+  await db.query('CREATE INDEX IF NOT EXISTS idx_customers_name ON customers(name, first_name, last_name)');
+  await db.query('CREATE INDEX IF NOT EXISTS idx_customers_mobile ON customers(mobile)');
+  await db.query('CREATE INDEX IF NOT EXISTS idx_customers_city ON customers(city)');
+  await db.query('CREATE INDEX IF NOT EXISTS idx_loans_customer_id ON loans(customer_id)');
+  await db.query('CREATE INDEX IF NOT EXISTS idx_loans_khata_no ON loans(khata_no)');
+  await db.query('CREATE INDEX IF NOT EXISTS idx_loans_status ON loans(status)');
+  await db.query('CREATE INDEX IF NOT EXISTS idx_schedules_loan_id ON schedules(loan_id)');
+  await db.query('CREATE INDEX IF NOT EXISTS idx_schedules_due_date ON schedules(due_date)');
+  await db.query('CREATE INDEX IF NOT EXISTS idx_payments_loan_id ON payments(loan_id)');
+  await db.query('CREATE INDEX IF NOT EXISTS idx_payments_schedule_id ON payments(schedule_id)');
+  await db.query('CREATE INDEX IF NOT EXISTS idx_payments_date ON payments(payment_date)');
+  await db.query('CREATE INDEX IF NOT EXISTS idx_blacklist_customer_id ON blacklist(customer_id)');
+  await db.query('CREATE INDEX IF NOT EXISTS idx_expired_customers_customer_id ON expired_customers(customer_id)');
+
   await db.query('CREATE INDEX IF NOT EXISTS idx_sessions_token_hash ON sessions(token_hash)');
   await db.query('CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id)');
   await db.query('CREATE INDEX IF NOT EXISTS idx_users_username ON users(username)');
@@ -1139,6 +1223,126 @@ function buildDashboardData(data, asOf, range = '6m') {
   };
 }
 
+
+async function normalizedMigrationStatus() {
+  const meta = await db.query('SELECT value FROM app_meta WHERE key = $1', ['normalized_data_v1']);
+  const counts = await db.query(`
+    SELECT
+      (SELECT COUNT(*)::int FROM customers) AS customers,
+      (SELECT COUNT(*)::int FROM loans) AS loans,
+      (SELECT COUNT(*)::int FROM schedules) AS schedules,
+      (SELECT COUNT(*)::int FROM payments) AS payments,
+      (SELECT COUNT(*)::int FROM blacklist) AS blacklist,
+      (SELECT COUNT(*)::int FROM notifications) AS notifications,
+      (SELECT COUNT(*)::int FROM expired_customers) AS expired_customers
+  `);
+  return { migratedAt: meta.rows[0]?.value || null, counts: counts.rows[0] || {} };
+}
+
+async function migrateJsonToNormalized() {
+  const source = await userData();
+  const issues = integrity(source);
+  if (issues.length) {
+    const error = new Error(`Source data has ${issues.length} integrity issue(s). Fix/validate the data before migration.`);
+    error.details = issues.slice(0, 20);
+    throw error;
+  }
+
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+    // Shadow migration: replace normalized tables atomically. The JSONB source is untouched.
+    await client.query('TRUNCATE TABLE payments, schedules, blacklist, notifications, deleted_records, expired_customers, loans, customers CASCADE');
+
+    const j = JSON.stringify;
+    await client.query(`
+      INSERT INTO customers
+        (id, first_name, middle_name, last_name, name, mobile, alternate_mobile, reference, address, city, district, pincode, status, created_at, updated_at, data_json)
+      SELECT r.id, r.first_name, r.middle_name, r.last_name, r.name, r.mobile, r.alternate_mobile, r.reference, r.address, r.city, r.district, r.pincode, r.status,
+             NULLIF(r.created_at,'')::timestamptz, NULLIF(r.updated_at,'')::timestamptz, src.raw
+      FROM jsonb_array_elements($1::jsonb) AS src(raw)
+      CROSS JOIN LATERAL jsonb_to_record(src.raw) AS r(
+        id text, first_name text, middle_name text, last_name text, name text, mobile text, alternate_mobile text,
+        reference text, address text, city text, district text, pincode text, status text, created_at text, updated_at text
+      )`, [j(source.customers)]);
+
+    await client.query(`
+      INSERT INTO loans
+        (id, customer_id, khata_no, loan_type, loan_against, amount, rate, emi, emi_option, start_date, status, created_at, updated_at, data_json)
+      SELECT r.id, r.customer_id, COALESCE(NULLIF(r.khata_no,''), NULLIF(r.legacy_khata_no,'')), r.loan_type, r.loan_against,
+             COALESCE(r.amount,0), COALESCE(r.rate,0), COALESCE(r.emi,0), r.emi_option, NULLIF(r.start_date,'')::date,
+             r.status, NULLIF(r.created_at,'')::timestamptz, NULLIF(r.updated_at,'')::timestamptz, src.raw
+      FROM jsonb_array_elements($1::jsonb) AS src(raw)
+      CROSS JOIN LATERAL jsonb_to_record(src.raw) AS r(
+        id text, customer_id text, khata_no text, legacy_khata_no text, loan_type text, loan_against text,
+        amount numeric, rate numeric, emi numeric, emi_option text, start_date text, status text, created_at text, updated_at text
+      )`, [j(source.loans)]);
+
+    await client.query(`
+      INSERT INTO schedules
+        (id, loan_id, due_date, installment_no, emi, principal, interest, penalty, paid, remaining, status, manual_pending, pending_added_at, pending_added_by, data_json)
+      SELECT r.id, r.loan_id, NULLIF(r.due_date,'')::date, NULLIF(r.installment_no,'')::int, COALESCE(r.emi,0), COALESCE(r.principal,0), COALESCE(r.interest,0),
+             COALESCE(r.penalty,0), COALESCE(r.paid,0), COALESCE(r.remaining,0), r.status, COALESCE(r.manual_pending,false),
+             NULLIF(r.pending_added_at,'')::timestamptz, r.pending_added_by, src.raw
+      FROM jsonb_array_elements($1::jsonb) AS src(raw)
+      CROSS JOIN LATERAL jsonb_to_record(src.raw) AS r(
+        id text, loan_id text, due_date text, installment_no text, emi numeric, principal numeric, interest numeric, penalty numeric,
+        paid numeric, remaining numeric, status text, manual_pending boolean, pending_added_at text, pending_added_by text
+      )`, [j(source.schedules)]);
+
+    await client.query(`
+      INSERT INTO payments
+        (id, loan_id, schedule_id, payment_date, principal, interest, penalty, total, mode, notes, created_at, activity_created_at, data_json)
+      SELECT r.id, r.loan_id, NULLIF(r.schedule_id,''), NULLIF(r.payment_date,'')::date, COALESCE(r.principal,0), COALESCE(r.interest,0), COALESCE(r.penalty,0),
+             COALESCE(r.total,0), r.mode, r.notes, NULLIF(r.created_at,'')::timestamptz, NULLIF(r.activity_created_at,'')::timestamptz, src.raw
+      FROM jsonb_array_elements($1::jsonb) AS src(raw)
+      CROSS JOIN LATERAL jsonb_to_record(src.raw) AS r(
+        id text, loan_id text, schedule_id text, payment_date text, principal numeric, interest numeric, penalty numeric, total numeric,
+        mode text, notes text, created_at text, activity_created_at text
+      )`, [j(source.payments)]);
+
+    await client.query(`
+      INSERT INTO blacklist (id, customer_id, reason, blacklist_date, notes, outstanding, created_at, data_json)
+      SELECT r.id, r.customer_id, r.reason, NULLIF(r.blacklist_date,'')::date, r.notes, COALESCE(r.outstanding,0), NULLIF(r.created_at,'')::timestamptz, src.raw
+      FROM jsonb_array_elements($1::jsonb) AS src(raw)
+      CROSS JOIN LATERAL jsonb_to_record(src.raw) AS r(id text, customer_id text, reason text, blacklist_date text, notes text, outstanding numeric, created_at text)
+    `, [j(source.blacklist)]);
+
+    await client.query(`
+      INSERT INTO notifications (id, customer_id, type, title, message, read, created_at, data_json)
+      SELECT r.id, NULLIF(r.customer_id,''), r.type, r.title, r.message, COALESCE(r.read,false), NULLIF(r.created_at,'')::timestamptz, src.raw
+      FROM jsonb_array_elements($1::jsonb) AS src(raw)
+      CROSS JOIN LATERAL jsonb_to_record(src.raw) AS r(id text, customer_id text, type text, title text, message text, read boolean, created_at text)
+    `, [j(source.notifications)]);
+
+    await client.query(`
+      INSERT INTO deleted_records (id, record_type, record_id, deleted_at, deleted_by, data_json)
+      SELECT r.id, r.record_type, r.record_id, NULLIF(r.deleted_at,'')::timestamptz, r.deleted_by, src.raw
+      FROM jsonb_array_elements($1::jsonb) AS src(raw)
+      CROSS JOIN LATERAL jsonb_to_record(src.raw) AS r(id text, record_type text, record_id text, deleted_at text, deleted_by text)
+    `, [j(source.deletedRecords)]);
+
+    await client.query(`
+      INSERT INTO expired_customers (id, customer_id, reason, expired_date, notes, data_json)
+      SELECT r.id, r.customer_id, r.reason, NULLIF(r.expired_date,'')::date, r.notes, src.raw
+      FROM jsonb_array_elements($1::jsonb) AS src(raw)
+      CROSS JOIN LATERAL jsonb_to_record(src.raw) AS r(id text, customer_id text, reason text, expired_date text, notes text)
+    `, [j(source.expiredCustomers)]);
+
+    await client.query(
+      `INSERT INTO app_meta(key, value) VALUES ($1,$2) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value`,
+      ['normalized_data_v1', now()]
+    );
+    await client.query('COMMIT');
+    return await normalizedMigrationStatus();
+  } catch (e) {
+    try { await client.query('ROLLBACK'); } catch {}
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
 async function api(req, res) {
   const parts = pathParts(req.url);
   const method = req.method || 'GET';
@@ -1913,6 +2117,28 @@ async function api(req, res) {
 
       await db.query('UPDATE users SET password_hash = $1 WHERE id = $2', [hashPassword(p), u.id]);
       return send(res, 200, { ok: true });
+    }
+  }
+
+  if (method === 'GET' && parts[1] === 'admin' && parts[2] === 'normalized-status' && !parts[3]) {
+    const u = await sessionUser(req);
+    if (!u) return send(res, 401, { error: 'Authentication required' });
+    if (!ADMIN_ROLES.has(u.role)) return send(res, 403, { error: 'Administrator permission required' });
+    return send(res, 200, await normalizedMigrationStatus());
+  }
+
+  if (method === 'POST' && parts[1] === 'admin' && parts[2] === 'migrate-normalized' && !parts[3]) {
+    const u = await sessionUser(req);
+    if (!u) return send(res, 401, { error: 'Authentication required' });
+    if (!ADMIN_ROLES.has(u.role)) return send(res, 403, { error: 'Administrator permission required' });
+    const b = await readBody(req);
+    if (b.confirm !== 'MIGRATE') return send(res, 400, { error: 'Type MIGRATE to confirm normalized database migration.' });
+    try {
+      const result = await migrateJsonToNormalized();
+      return send(res, 200, { ok: true, ...result, source: 'user_data JSONB preserved' });
+    } catch (e) {
+      console.error('Normalized migration failed:', e);
+      return send(res, 400, { error: e.message || 'Normalized migration failed', details: e.details || [] });
     }
   }
 

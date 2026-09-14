@@ -58,7 +58,7 @@ function blankData() {
     expiredCustomers: [],
     pendingQueue: [],
     settings: {
-      appName: 'Loan Management',
+      appName: 'Kissan-King Assistance',
       currency: 'INR',
       defaultInterest: 2,
       defaultPenalty: 0,
@@ -418,7 +418,7 @@ function mergeDataSets(items) {
     for (const id of d.pendingQueue || []) pendingIds.add(String(id));
     if (!out.settings.logoData && d.settings.logoData) out.settings.logoData = d.settings.logoData;
     if (d.settings.appName) {
-      out.settings.appName = d.settings.appName === 'Kissan King Assistance' ? 'Loan Management' : d.settings.appName;
+      out.settings.appName = d.settings.appName === 'Kissan-King Assistance' ? 'Kissan-King Assistance' : d.settings.appName;
     }
     if (Number.isFinite(Number(d.settings.defaultInterest))) out.settings.defaultInterest = Number(d.settings.defaultInterest);
     if (Number.isFinite(Number(d.settings.defaultPenalty))) out.settings.defaultPenalty = Number(d.settings.defaultPenalty);
@@ -1616,7 +1616,7 @@ async function api(req, res) {
     const settings = r.rows[0]?.settings || {};
     return send(res, 200, {
       branding: {
-        appName: String(settings.appName || 'Loan Management'),
+        appName: String(settings.appName || 'Kissan-King Assistance'),
         logoData: String(settings.logoData || ''),
         logoEnabled: settings.logoEnabled !== false
       }
@@ -2999,7 +2999,7 @@ async function start() {
     await initDb();
 
     server.listen(PORT, HOST, () => {
-      console.log(`Loan Management server running at http://${HOST}:${PORT}`);
+      console.log(`Kissan-King Assistance server running at http://${HOST}:${PORT}`);
     });
   } catch (e) {
     console.error('Failed to start application:', e.message);

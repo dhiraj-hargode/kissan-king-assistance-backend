@@ -1994,6 +1994,93 @@ async function api(req, res) {
     return send(res, 201, { ok: true, customer, user: u });
   }
 
+  // Targeted mutation API. The browser sends only changed records instead of
+  // PUTing the entire shared JSONB document. Multiple related changes are applied
+  // atomically in one request, while the existing JSONB storage remains intact.
+  if (method === 'POST' && parts[1] === 'mutations' && !parts[2]) {
+    const b = await readBody(req);
+    const operations = Array.isArray(b?.operations) ? b.operations.slice(0, 5000) : [];
+    if (!operations.length) return send(res, 400, { error: 'At least one mutation is required' });
+
+    const allowedTypes = new Set(['customers','loans','schedules','payments','blacklist','notifications','deletedRecords','expiredCustomers','pendingQueue','settings']);
+    for (const op of operations) {
+      if (!op || !allowedTypes.has(String(op.type))) return send(res, 400, { error: 'Invalid mutation type' });
+      if (!['create','update','delete','replace'].includes(String(op.action))) return send(res, 400, { error: 'Invalid mutation action' });
+    }
+
+    const hasDelete = operations.some(op => op.action === 'delete');
+    const hasPayment = operations.some(op => op.type === 'payments');
+    const hasWrite = operations.some(op => ['customers','loans','schedules','blacklist','expiredCustomers','pendingQueue'].includes(op.type));
+    const hasDeletedHistory = operations.some(op => op.type === 'deletedRecords');
+    const hasSettings = operations.some(op => op.type === 'settings');
+    if ((hasDelete || hasDeletedHistory) && !ADMIN_ROLES.has(u.role)) return send(res, 403, { error: 'Only Administrators can delete records or modify audit history' });
+    if (hasPayment && !PAYMENT_ROLES.has(u.role)) return send(res, 403, { error: 'You do not have permission to manage payments' });
+    if (hasWrite && !WRITE_ROLES.has(u.role)) return send(res, 403, { error: 'You do not have write permission' });
+    if (hasSettings && !ADMIN_ROLES.has(u.role)) return send(res, 403, { error: 'Only Administrators can change settings' });
+
+    const client = await db.connect();
+    try {
+      await client.query('BEGIN');
+      const result = await client.query('SELECT data_json FROM user_data WHERE user_id = $1 FOR UPDATE', [SHARED_DATA_ID]);
+      let data;
+      if (result.rows[0]) {
+        const value = typeof result.rows[0].data_json === 'string' ? JSON.parse(result.rows[0].data_json) : result.rows[0].data_json;
+        data = normalizeData(value);
+      } else {
+        data = blankData();
+      }
+
+      const arrays = new Set(['customers','loans','schedules','payments','blacklist','notifications','deletedRecords','expiredCustomers']);
+      for (const op of operations) {
+        if (op.type === 'settings' && op.action === 'replace') {
+          data.settings = { ...blankData().settings, ...(op.record || {}) };
+          continue;
+        }
+        if (op.type === 'pendingQueue' && op.action === 'replace') {
+          data.pendingQueue = Array.isArray(op.records) ? op.records.map(String) : [];
+          continue;
+        }
+        if (!arrays.has(op.type)) continue;
+        const list = data[op.type];
+        const id = String(op.id ?? op.record?.id ?? '');
+        const index = list.findIndex(x => String(x?.id) === id);
+        if (op.action === 'create') {
+          if (index >= 0) { await client.query('ROLLBACK'); return send(res, 409, { error: `${op.type} record already exists: ${id}` }); }
+          if (!op.record || !id) { await client.query('ROLLBACK'); return send(res, 400, { error: `Invalid ${op.type} create operation` }); }
+          list.push(op.record);
+        } else if (op.action === 'update') {
+          if (index < 0) { await client.query('ROLLBACK'); return send(res, 404, { error: `${op.type} record not found: ${id}` }); }
+          if (!op.record) { await client.query('ROLLBACK'); return send(res, 400, { error: `Invalid ${op.type} update operation` }); }
+          list[index] = op.record;
+        } else if (op.action === 'delete') {
+          if (index >= 0) list.splice(index, 1);
+        }
+      }
+
+      const errors = integrity(data);
+      if (errors.length) {
+        await client.query('ROLLBACK');
+        return send(res, 400, { error: 'Data validation failed', details: errors.slice(0, 20) });
+      }
+
+      const normalized = normalizeData(data);
+      await client.query(
+        `INSERT INTO user_data(user_id, data_json, updated_at)
+         VALUES ($1, $2::jsonb, $3)
+         ON CONFLICT (user_id) DO UPDATE SET data_json = EXCLUDED.data_json, updated_at = EXCLUDED.updated_at`,
+        [SHARED_DATA_ID, JSON.stringify(normalized), now()]
+      );
+      await client.query('COMMIT');
+      return send(res, 200, { ok: true, applied: operations.length, user: u });
+    } catch (e) {
+      try { await client.query('ROLLBACK'); } catch {}
+      console.error('Mutation API failed:', e);
+      return send(res, 500, { error: e.message || 'Could not apply changes' });
+    } finally {
+      client.release();
+    }
+  }
+
   if (method === 'GET' && parts[1] === 'db') {
     return send(res, 200, { data: await userData(), user: u });
   }

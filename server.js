@@ -1255,6 +1255,160 @@ async function api(req, res) {
     });
   }
 
+  // Targeted collections read APIs. These return only the collection rows needed
+  // by the current page instead of forcing the browser to load the complete JSONB
+  // database. Phase 3 can move the same contracts to normalized SQL tables.
+  if (method === 'GET' && parts[1] === 'collections' && parts[2] === 'today') {
+    const u = await sessionUser(req);
+    if (!u) return send(res, 401, { error: 'Authentication required' });
+    const url = new URL(req.url, 'http://localhost');
+    const selected = isoDateFromQuery(url.searchParams.get('date'));
+    const search = String(url.searchParams.get('search') || '').trim().toLowerCase().slice(0, 100);
+    const d = await userData(u.userId);
+    const customers = Array.isArray(d.customers) ? d.customers : [];
+    const loans = Array.isArray(d.loans) ? d.loans : [];
+    const schedules = Array.isArray(d.schedules) ? d.schedules : [];
+    const payments = Array.isArray(d.payments) ? d.payments : [];
+    const expired = new Set((Array.isArray(d.expiredCustomers) ? d.expiredCustomers : []).map(x => String(x?.customerId || x?.id || '')));
+    const pendingIds = new Set((Array.isArray(d.pendingQueue) ? d.pendingQueue : []).map(String));
+    const customerById = new Map(customers.map(c => [String(c.id), c]));
+    const loanById = new Map(loans.map(l => [String(l.id), l]));
+    const loanCustomer = l => l ? customerById.get(String(l.customerId)) || null : null;
+    const scheduleTotals = new Map();
+    for (const p of payments) {
+      const sid = String(p?.scheduleId || '').trim();
+      if (!sid) continue;
+      const x = scheduleTotals.get(sid) || { principalInterest: 0, penalty: 0 };
+      x.principalInterest += Number(p?.principal || 0) + Number(p?.interest || 0);
+      x.penalty += Number(p?.penalty || 0);
+      scheduleTotals.set(sid, x);
+    }
+    const scheduleDue = s => {
+      const t = scheduleTotals.get(String(s?.id)) || { principalInterest: 0, penalty: 0 };
+      const installment = Math.max(0, Number(s?.emi || 0) - Math.max(Number(s?.paid || 0), t.principalInterest));
+      const unpaidPenalty = Math.max(0, Number(s?.penalty || 0) - t.penalty);
+      return Number((installment + unpaidPenalty).toFixed(2));
+    };
+    const byLoan = new Map();
+    for (const s of schedules) {
+      if (String(s?.dueDate || '') !== selected || s?.manualPending) continue;
+      const l = loanById.get(String(s?.loanId || ''));
+      if (!l || expired.has(String(l.customerId))) continue;
+      const due = scheduleDue(s);
+      const sid = String(s.id);
+      const t = scheduleTotals.get(sid) || { principalInterest: 0, penalty: 0 };
+      const status = due <= 0.005 ? 'PAID' : String(s.dueDate) < selected ? 'OVERDUE' : String(s.dueDate) === selected ? 'DUE TODAY' : 'UPCOMING';
+      const row = byLoan.get(String(l.id)) || { loan: l, customer: loanCustomer(l), schedules: [], due: 0, grossDue: 0, paidOnDate: 0, fullyPaidInstallment: true, hasPaidSchedule: false };
+      row.schedules.push(s);
+      row.due += due;
+      row.grossDue += Number(s?.emi || 0) + Number(s?.penalty || 0);
+      row.fullyPaidInstallment = row.fullyPaidInstallment && due <= 0.005;
+      row.hasPaidSchedule = row.hasPaidSchedule || status === 'PAID';
+      byLoan.set(String(l.id), row);
+    }
+    const paymentBySchedule = new Map();
+    const paymentByLoan = new Map();
+    const principalByLoan = new Map();
+    for (const p of payments) {
+      const plid = String(p?.loanId || '');
+      principalByLoan.set(plid, (principalByLoan.get(plid) || 0) + Number(p?.principal || 0));
+      if (String(p?.date || '') !== selected) continue;
+      const lid = String(p?.loanId || '');
+      const sid = String(p?.scheduleId || '').trim();
+      if (sid) paymentBySchedule.set(sid, (paymentBySchedule.get(sid) || 0) + Number(p?.total || 0));
+      paymentByLoan.set(lid, (paymentByLoan.get(lid) || 0) + Number(p?.total || 0));
+    }
+    const rows = [];
+    for (const row of byLoan.values()) {
+      const l = row.loan, c = row.customer;
+      row.loan = { ...l, paidPrincipal: principalByLoan.get(String(l.id)) || 0 };
+      row.paidOnDate = row.schedules.reduce((sum, s) => sum + (paymentBySchedule.get(String(s.id)) || 0), 0);
+      const fullyPaidToday = row.fullyPaidInstallment || (row.paidOnDate > 0 && row.grossDue > 0 && row.paidOnDate >= row.grossDue - 0.005);
+      const visible = !row.schedules.some(s => pendingIds.has(String(s.id))) || row.fullyPaidInstallment;
+      if (!visible) continue;
+      const haystack = [l?.legacyKhataNo, l?.khataNo, l?.id, c?.id, c?.mobile, c?.reference, c?.firstName, c?.middleName, c?.lastName, c?.city, c?.district].filter(Boolean).join(' ').toLowerCase();
+      if (search && !haystack.includes(search)) continue;
+      const unpaid = row.schedules.find(s => scheduleDue(s) > 0.005) || row.schedules[0];
+      rows.push({ ...row, s: unpaid, due: row.fullyPaidInstallment ? 0 : Number(Math.max(0, row.due - row.paidOnDate).toFixed(2)), fullyPaidToday });
+    }
+    rows.sort((a,b) => String(a.loan?.id || '').localeCompare(String(b.loan?.id || '')));
+    const allocated = payments.filter(p => String(p?.date || '') === selected && (!p.scheduleId || rows.some(r => r.schedules.some(s => String(s.id) === String(p.scheduleId)))));
+    return send(res, 200, {
+      date: selected,
+      rows,
+      summary: {
+        entries: rows.length,
+        expected: rows.reduce((sum,r) => sum + Number(r.grossDue || 0), 0),
+        collected: allocated.reduce((sum,p) => sum + Number(p.total || 0), 0),
+        interest: allocated.reduce((sum,p) => sum + Number(p.interest || 0), 0),
+        pending: rows.reduce((sum,r) => sum + Number(r.due || 0), 0)
+      },
+      user: u
+    });
+  }
+
+  if (method === 'GET' && parts[1] === 'collections' && parts[2] === 'pending') {
+    const u = await sessionUser(req);
+    if (!u) return send(res, 401, { error: 'Authentication required' });
+    const url = new URL(req.url, 'http://localhost');
+    const rawPage = Number.parseInt(url.searchParams.get('page') || '1', 10);
+    const rawLimit = Number.parseInt(url.searchParams.get('limit') || '50', 10);
+    const page = Number.isFinite(rawPage) ? Math.max(1, rawPage) : 1;
+    const limit = Number.isFinite(rawLimit) ? Math.min(100, Math.max(1, rawLimit)) : 50;
+    const search = String(url.searchParams.get('search') || '').trim().toLowerCase().slice(0, 100);
+    const asOf = isoDateFromQuery(url.searchParams.get('date'));
+    const d = await userData(u.userId);
+    const customers = Array.isArray(d.customers) ? d.customers : [];
+    const loans = Array.isArray(d.loans) ? d.loans : [];
+    const schedules = Array.isArray(d.schedules) ? d.schedules : [];
+    const payments = Array.isArray(d.payments) ? d.payments : [];
+    const expired = new Set((Array.isArray(d.expiredCustomers) ? d.expiredCustomers : []).map(x => String(x?.customerId || x?.id || '')));
+    const pendingIds = new Set((Array.isArray(d.pendingQueue) ? d.pendingQueue : []).map(String));
+    const customerById = new Map(customers.map(c => [String(c.id), c]));
+    const loanById = new Map(loans.map(l => [String(l.id), l]));
+    const totals = new Map();
+    for (const p of payments) {
+      const sid = String(p?.scheduleId || '').trim();
+      if (!sid) continue;
+      const x = totals.get(sid) || { principalInterest: 0, penalty: 0 };
+      x.principalInterest += Number(p?.principal || 0) + Number(p?.interest || 0);
+      x.penalty += Number(p?.penalty || 0);
+      totals.set(sid, x);
+    }
+    const due = s => {
+      const t = totals.get(String(s?.id)) || { principalInterest: 0, penalty: 0 };
+      return Number((Math.max(0, Number(s?.emi || 0) - Math.max(Number(s?.paid || 0), t.principalInterest)) + Math.max(0, Number(s?.penalty || 0) - t.penalty)).toFixed(2));
+    };
+    const rows = [];
+    for (const s of schedules) {
+      if (!pendingIds.has(String(s?.id)) || !s?.pendingAddedAt) continue;
+      const l = loanById.get(String(s?.loanId || ''));
+      if (!l || expired.has(String(l.customerId))) continue;
+      const c = customerById.get(String(l.customerId)) || null;
+      const pending = due(s);
+      if (pending <= 0.005 || String(l.status || '').toUpperCase() === 'CLOSED') continue;
+      const status = String(s.dueDate) < asOf ? 'OVERDUE' : String(s.dueDate) === asOf ? 'DUE TODAY' : 'UPCOMING';
+      const khata = l?.legacyKhataNo || l?.khataNo || l?.id || '-';
+      const haystack = [c?.firstName,c?.middleName,c?.lastName,c?.mobile,c?.id,khata,l?.id,status].filter(Boolean).join(' ').toLowerCase();
+      if (search && !haystack.includes(search)) continue;
+      rows.push({ schedule:s, loan:l, customer:c, pending, status, daysLate: Math.max(0, Math.floor((new Date(asOf+'T00:00:00') - new Date(String(s.dueDate)+'T00:00:00')) / 86400000)) });
+    }
+    rows.sort((a,b) => String(b.schedule?.dueDate || '').localeCompare(String(a.schedule?.dueDate || '')));
+    const total = rows.length;
+    const totalPages = Math.max(1, Math.ceil(total / limit));
+    const safePage = Math.min(page, totalPages);
+    const start = (safePage - 1) * limit;
+    const data = rows.slice(start, start + limit);
+    const overdue = rows.filter(r => r.status === 'OVERDUE');
+    const dueToday = rows.filter(r => r.status === 'DUE TODAY');
+    return send(res, 200, {
+      rows: data,
+      summary: { totalPending: rows.reduce((sum,r) => sum + r.pending, 0), overdueLoans: new Set(overdue.map(r => r.loan.id)).size, overdueEmis: overdue.length, dueToday: dueToday.reduce((sum,r) => sum + r.pending, 0) },
+      pagination: { page:safePage, limit, total, totalPages, hasNext:safePage<totalPages, hasPrevious:safePage>1 },
+      user:u
+    });
+  }
+
   if (method === 'GET' && parts[1] === 'customers' && parts[2]) {
     const u = await sessionUser(req);
     if (!u) return send(res, 401, { error: 'Authentication required' });

@@ -1810,24 +1810,33 @@ async function api(req, res) {
   }
 
   // Paginated customer read API. This endpoint is directly backed by normalized PostgreSQL.
-  // Payment history reads are backed by normalized PostgreSQL via userData().
+  // Payment history reads are backed directly by normalized PostgreSQL.
   if (method === 'GET' && parts[1] === 'payments' && parts[2]) {
     const u = await sessionUser(req);
     if (!u) return send(res, 401, { error: 'Authentication required' });
     const paymentId = decodeURIComponent(parts[2]);
-    const d = await userData(u.userId);
-    const payments = Array.isArray(d.payments) ? d.payments : [];
-    const loans = Array.isArray(d.loans) ? d.loans : [];
-    const customers = Array.isArray(d.customers) ? d.customers : [];
-    const schedules = Array.isArray(d.schedules) ? d.schedules : [];
-    const payment = payments.find(p => String(p?.id) === String(paymentId));
-    if (!payment) return send(res, 404, { error: 'Payment not found' });
-    const loan = loans.find(l => String(l?.id) === String(payment.loanId)) || null;
-    const customer = loan ? customers.find(c => String(c?.id) === String(loan.customerId)) || null : null;
-    const schedule = payment.scheduleId
-      ? schedules.find(s => String(s?.id) === String(payment.scheduleId)) || null
-      : null;
-    return send(res, 200, { payment, loan, customer, schedule, user: u });
+    const result = await db.query(`
+      SELECT
+        p.data_json AS payment_json,
+        l.data_json AS loan_json,
+        c.data_json AS customer_json,
+        s.data_json AS schedule_json
+      FROM payments p
+      JOIN loans l ON l.id = p.loan_id
+      JOIN customers c ON c.id = l.customer_id
+      LEFT JOIN schedules s ON s.id = p.schedule_id
+      WHERE p.id = $1
+      LIMIT 1
+    `, [paymentId]);
+    if (!result.rows.length) return send(res, 404, { error: 'Payment not found' });
+    const row = result.rows[0];
+    return send(res, 200, {
+      payment: rowJson(row.payment_json),
+      loan: rowJson(row.loan_json),
+      customer: rowJson(row.customer_json),
+      schedule: row.schedule_json ? rowJson(row.schedule_json) : null,
+      user: u
+    });
   }
 
   if (method === 'GET' && parts[1] === 'payments' && !parts[2]) {
@@ -1838,58 +1847,88 @@ async function api(req, res) {
     const rawLimit = Number.parseInt(url.searchParams.get('limit') || '50', 10);
     const page = Number.isFinite(rawPage) ? Math.max(1, rawPage) : 1;
     const limit = Number.isFinite(rawLimit) ? Math.min(100, Math.max(1, rawLimit)) : 50;
-    const search = String(url.searchParams.get('search') || '').trim().toLowerCase().slice(0, 100);
+    const search = String(url.searchParams.get('search') || '').trim().slice(0, 100);
     const from = isoDateFromQuery(url.searchParams.get('from'));
     const to = isoDateFromQuery(url.searchParams.get('to'));
     const mode = String(url.searchParams.get('mode') || '').trim().toLowerCase().slice(0, 50);
     const customerId = String(url.searchParams.get('customerId') || '').trim();
     const loanId = String(url.searchParams.get('loanId') || '').trim();
-    const d = await userData(u.userId);
-    const payments = Array.isArray(d.payments) ? d.payments : [];
-    const loans = Array.isArray(d.loans) ? d.loans : [];
-    const customers = Array.isArray(d.customers) ? d.customers : [];
-    const loanById = new Map(loans.map(l => [String(l.id), l]));
-    const customerById = new Map(customers.map(c => [String(c.id), c]));
-    const rows = [];
-    for (const payment of payments) {
-      const lid = String(payment?.loanId || '');
-      const loan = loanById.get(lid) || null;
-      const customer = loan ? customerById.get(String(loan.customerId)) || null : null;
-      const cid = String(loan?.customerId || '');
-      if (customerId && cid !== customerId) continue;
-      if (loanId && lid !== loanId) continue;
-      const date = String(payment?.date || '');
-      if (from && date < from) continue;
-      if (to && date > to) continue;
-      if (mode && String(payment?.mode || '').toLowerCase() !== mode) continue;
-      const name = [customer?.firstName, customer?.middleName, customer?.lastName].filter(Boolean).join(' ') || String(customer?.name || '');
-      const haystack = [payment.id, payment.date, payment.loanId, loan?.khataNo, loan?.legacyKhataNo, loan?.id, cid, name, customer?.mobile, customer?.reference].join(' ').toLowerCase();
-      if (search && !haystack.includes(search)) continue;
-      rows.push({ ...payment, loan, customer });
+    const offset = (page - 1) * limit;
+
+    const filterParams = [search, from || null, to || null, mode || null, customerId || null, loanId || null];
+    const filterSql = `
+      FROM payments p
+      JOIN loans l ON l.id = p.loan_id
+      JOIN customers c ON c.id = l.customer_id
+      WHERE ($1 = '' OR concat_ws(' ',
+        p.id, p.payment_date::text, p.loan_id, l.khata_no, l.loan_type, l.loan_against,
+        c.id, c.first_name, c.middle_name, c.last_name, c.name, c.mobile, c.reference
+      ) ILIKE '%' || $1 || '%')
+        AND ($2::date IS NULL OR p.payment_date >= $2::date)
+        AND ($3::date IS NULL OR p.payment_date <= $3::date)
+        AND ($4 = '' OR lower(COALESCE(p.mode, '')) = $4)
+        AND ($5 = '' OR l.customer_id = $5)
+        AND ($6 = '' OR p.loan_id = $6)
+    `;
+
+    const [paymentResult, countResult] = await Promise.all([
+      db.query(`
+        SELECT p.data_json AS payment_json, l.data_json AS loan_json, c.data_json AS customer_json
+        ${filterSql}
+        ORDER BY p.payment_date DESC NULLS LAST, p.id DESC
+        LIMIT $7::int OFFSET $8::int
+      `, [...filterParams, limit, offset]),
+      db.query(`
+        SELECT COUNT(*)::int AS total,
+               COALESCE(SUM(p.total), 0)::numeric AS total_collection,
+               COALESCE(SUM(p.principal), 0)::numeric AS principal,
+               COALESCE(SUM(p.interest), 0)::numeric AS interest,
+               COALESCE(SUM(p.penalty), 0)::numeric AS penalty,
+               COUNT(DISTINCT p.loan_id)::int AS matching_loans
+        ${filterSql}
+      `, filterParams)
+    ]);
+
+    const payments = paymentResult.rows.map(row => ({
+      ...rowJson(row.payment_json),
+      loan: rowJson(row.loan_json),
+      customer: rowJson(row.customer_json)
+    }));
+    const total = Number(countResult.rows[0]?.total || 0);
+    const totalCollection = Number(countResult.rows[0]?.total_collection || 0);
+    const principal = Number(countResult.rows[0]?.principal || 0);
+    const interest = Number(countResult.rows[0]?.interest || 0);
+    const penalty = Number(countResult.rows[0]?.penalty || 0);
+    const matchingLoans = Number(countResult.rows[0]?.matching_loans || 0);
+
+    // Remaining/loanAmount are based on the loans represented by the filtered
+    // payment result, while principal paid is calculated from all payments.
+    const filteredLoanIds = [...new Set(payments.map(p => String(p?.loan?.id || p?.loanId || '')).filter(Boolean))];
+    let loanAmount = 0;
+    let remaining = 0;
+    if (filteredLoanIds.length) {
+      const loanSummary = await db.query(`
+        SELECT
+          COALESCE(SUM(l.amount), 0)::numeric AS loan_amount,
+          COALESCE(SUM(GREATEST(0, l.amount - COALESCE(pp.paid_principal, 0))), 0)::numeric AS remaining
+        FROM loans l
+        LEFT JOIN (
+          SELECT loan_id, SUM(principal)::numeric AS paid_principal
+          FROM payments
+          WHERE loan_id = ANY($1::text[])
+          GROUP BY loan_id
+        ) pp ON pp.loan_id = l.id
+        WHERE l.id = ANY($1::text[])
+      `, [filteredLoanIds]);
+      loanAmount = Number(loanSummary.rows[0]?.loan_amount || 0);
+      remaining = Number(loanSummary.rows[0]?.remaining || 0);
     }
-    rows.sort((a, b) => String(b.date || '').localeCompare(String(a.date || '')) || String(b.id || '').localeCompare(String(a.id || '')));
-    const total = rows.length;
-    const totalCollection = rows.reduce((sum, p) => sum + Number(p.total || 0), 0);
-    const principal = rows.reduce((sum, p) => sum + Number(p.principal || 0), 0);
-    const interest = rows.reduce((sum, p) => sum + Number(p.interest || 0), 0);
-    const penalty = rows.reduce((sum, p) => sum + Number(p.penalty || 0), 0);
-    const loanMap = new Map();
-    for (const row of rows) if (row.loan) loanMap.set(String(row.loan.id), row.loan);
-    const loanAmount = [...loanMap.values()].reduce((sum, l) => sum + Number(l.amount || 0), 0);
-    const principalPaidByLoan = new Map();
-    for (const p of payments) {
-      const lid = String(p?.loanId || '');
-      if (!lid) continue;
-      principalPaidByLoan.set(lid, (principalPaidByLoan.get(lid) || 0) + Number(p?.principal || 0));
-    }
-    const remaining = [...loanMap.values()].reduce((sum, l) => sum + Math.max(0, Number(l.amount || 0) - (principalPaidByLoan.get(String(l.id)) || 0)), 0);
+
     const totalPages = Math.max(1, Math.ceil(total / limit));
     const safePage = Math.min(page, totalPages);
-    const start = (safePage - 1) * limit;
-    const data = rows.slice(start, start + limit);
     return send(res, 200, {
-      payments: data,
-      summary: { transactions: total, totalCollection, principal, interest, penalty, loanAmount, remaining, matchingLoans: loanMap.size },
+      payments,
+      summary: { transactions: total, totalCollection, principal, interest, penalty, loanAmount, remaining, matchingLoans },
       pagination: { page: safePage, limit, total, totalPages, hasNext: safePage < totalPages, hasPrevious: safePage > 1 },
       user: u
     });

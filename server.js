@@ -1254,79 +1254,146 @@ async function migrateJsonToNormalized() {
     // Shadow migration: replace normalized tables atomically. The JSONB source is untouched.
     await client.query('TRUNCATE TABLE payments, schedules, blacklist, notifications, deleted_records, expired_customers, loans, customers CASCADE');
 
+    // IMPORTANT: application JSON uses camelCase field names (customerId, loanId,
+    // createdAt, interestRate, etc.).  The normalized SQL schema uses snake_case.
+    // Read both camelCase and snake_case so older backups remain compatible.
     const j = JSON.stringify;
+
     await client.query(`
       INSERT INTO customers
         (id, first_name, middle_name, last_name, name, mobile, alternate_mobile, reference, address, city, district, pincode, status, created_at, updated_at, data_json)
-      SELECT r.id, r.first_name, r.middle_name, r.last_name, r.name, r.mobile, r.alternate_mobile, r.reference, r.address, r.city, r.district, r.pincode, r.status,
-             NULLIF(r.created_at,'')::timestamptz, NULLIF(r.updated_at,'')::timestamptz, src.raw
+      SELECT
+        src.raw->>'id',
+        COALESCE(NULLIF(src.raw->>'firstName',''), NULLIF(src.raw->>'first_name','')),
+        COALESCE(NULLIF(src.raw->>'middleName',''), NULLIF(src.raw->>'middle_name','')),
+        COALESCE(NULLIF(src.raw->>'lastName',''), NULLIF(src.raw->>'last_name','')),
+        src.raw->>'name',
+        COALESCE(NULLIF(src.raw->>'mobile',''), NULLIF(src.raw->>'phone','')),
+        COALESCE(NULLIF(src.raw->>'alternateMobile',''), NULLIF(src.raw->>'alternate_mobile','')),
+        COALESCE(NULLIF(src.raw->>'reference',''), NULLIF(src.raw->>'customerReference','')),
+        src.raw->>'address', src.raw->>'city', src.raw->>'district', src.raw->>'pincode', src.raw->>'status',
+        NULLIF(COALESCE(src.raw->>'createdAt', src.raw->>'created_at'),'')::timestamptz,
+        NULLIF(COALESCE(src.raw->>'updatedAt', src.raw->>'updated_at'),'')::timestamptz,
+        src.raw
       FROM jsonb_array_elements($1::jsonb) AS src(raw)
-      CROSS JOIN LATERAL jsonb_to_record(src.raw) AS r(
-        id text, first_name text, middle_name text, last_name text, name text, mobile text, alternate_mobile text,
-        reference text, address text, city text, district text, pincode text, status text, created_at text, updated_at text
-      )`, [j(source.customers)]);
+      WHERE NULLIF(src.raw->>'id','') IS NOT NULL
+    `, [j(source.customers)]);
 
     await client.query(`
       INSERT INTO loans
         (id, customer_id, khata_no, loan_type, loan_against, amount, rate, emi, emi_option, start_date, status, created_at, updated_at, data_json)
-      SELECT r.id, r.customer_id, COALESCE(NULLIF(r.khata_no,''), NULLIF(r.legacy_khata_no,'')), r.loan_type, r.loan_against,
-             COALESCE(r.amount,0), COALESCE(r.rate,0), COALESCE(r.emi,0), r.emi_option, NULLIF(r.start_date,'')::date,
-             r.status, NULLIF(r.created_at,'')::timestamptz, NULLIF(r.updated_at,'')::timestamptz, src.raw
+      SELECT
+        src.raw->>'id',
+        COALESCE(NULLIF(src.raw->>'customerId',''), NULLIF(src.raw->>'customer_id','')),
+        COALESCE(NULLIF(src.raw->>'khataNo',''), NULLIF(src.raw->>'khata_no',''), NULLIF(src.raw->>'legacyKhataNo',''), NULLIF(src.raw->>'legacy_khata_no','')),
+        COALESCE(NULLIF(src.raw->>'loanType',''), NULLIF(src.raw->>'loan_type','')),
+        COALESCE(NULLIF(src.raw->>'loanAgainst',''), NULLIF(src.raw->>'loan_against','')),
+        COALESCE(NULLIF(src.raw->>'amount','')::numeric, 0),
+        COALESCE(NULLIF(src.raw->>'interestRate','')::numeric, NULLIF(src.raw->>'rate','')::numeric, 0),
+        COALESCE(NULLIF(src.raw->>'emi','')::numeric, 0),
+        COALESCE(NULLIF(src.raw->>'emiOption',''), NULLIF(src.raw->>'emi_option','')),
+        NULLIF(COALESCE(src.raw->>'startDate', src.raw->>'start_date'),'')::date,
+        src.raw->>'status',
+        NULLIF(COALESCE(src.raw->>'createdAt', src.raw->>'created_at'),'')::timestamptz,
+        NULLIF(COALESCE(src.raw->>'updatedAt', src.raw->>'updated_at'),'')::timestamptz,
+        src.raw
       FROM jsonb_array_elements($1::jsonb) AS src(raw)
-      CROSS JOIN LATERAL jsonb_to_record(src.raw) AS r(
-        id text, customer_id text, khata_no text, legacy_khata_no text, loan_type text, loan_against text,
-        amount numeric, rate numeric, emi numeric, emi_option text, start_date text, status text, created_at text, updated_at text
-      )`, [j(source.loans)]);
+      WHERE NULLIF(src.raw->>'id','') IS NOT NULL
+    `, [j(source.loans)]);
 
     await client.query(`
       INSERT INTO schedules
         (id, loan_id, due_date, installment_no, emi, principal, interest, penalty, paid, remaining, status, manual_pending, pending_added_at, pending_added_by, data_json)
-      SELECT r.id, r.loan_id, NULLIF(r.due_date,'')::date, NULLIF(r.installment_no,'')::int, COALESCE(r.emi,0), COALESCE(r.principal,0), COALESCE(r.interest,0),
-             COALESCE(r.penalty,0), COALESCE(r.paid,0), COALESCE(r.remaining,0), r.status, COALESCE(r.manual_pending,false),
-             NULLIF(r.pending_added_at,'')::timestamptz, r.pending_added_by, src.raw
+      SELECT
+        src.raw->>'id',
+        COALESCE(NULLIF(src.raw->>'loanId',''), NULLIF(src.raw->>'loan_id','')),
+        NULLIF(COALESCE(src.raw->>'dueDate', src.raw->>'due_date'),'')::date,
+        COALESCE(NULLIF(src.raw->>'installment','')::int, NULLIF(src.raw->>'installmentNo','')::int, NULLIF(src.raw->>'installment_no','')::int),
+        COALESCE(NULLIF(src.raw->>'emi','')::numeric, 0),
+        COALESCE(NULLIF(src.raw->>'principal','')::numeric, 0),
+        COALESCE(NULLIF(src.raw->>'interest','')::numeric, 0),
+        COALESCE(NULLIF(src.raw->>'penalty','')::numeric, 0),
+        COALESCE(NULLIF(src.raw->>'paid','')::numeric, 0),
+        COALESCE(NULLIF(src.raw->>'remaining','')::numeric, 0),
+        src.raw->>'status',
+        COALESCE(NULLIF(src.raw->>'manualPending','')::boolean, NULLIF(src.raw->>'manual_pending','')::boolean, false),
+        NULLIF(COALESCE(src.raw->>'pendingAddedAt', src.raw->>'pending_added_at'),'')::timestamptz,
+        COALESCE(NULLIF(src.raw->>'pendingAddedBy',''), NULLIF(src.raw->>'pending_added_by','')),
+        src.raw
       FROM jsonb_array_elements($1::jsonb) AS src(raw)
-      CROSS JOIN LATERAL jsonb_to_record(src.raw) AS r(
-        id text, loan_id text, due_date text, installment_no text, emi numeric, principal numeric, interest numeric, penalty numeric,
-        paid numeric, remaining numeric, status text, manual_pending boolean, pending_added_at text, pending_added_by text
-      )`, [j(source.schedules)]);
+      WHERE NULLIF(src.raw->>'id','') IS NOT NULL
+    `, [j(source.schedules)]);
 
     await client.query(`
       INSERT INTO payments
         (id, loan_id, schedule_id, payment_date, principal, interest, penalty, total, mode, notes, created_at, activity_created_at, data_json)
-      SELECT r.id, r.loan_id, NULLIF(r.schedule_id,''), NULLIF(r.payment_date,'')::date, COALESCE(r.principal,0), COALESCE(r.interest,0), COALESCE(r.penalty,0),
-             COALESCE(r.total,0), r.mode, r.notes, NULLIF(r.created_at,'')::timestamptz, NULLIF(r.activity_created_at,'')::timestamptz, src.raw
+      SELECT
+        src.raw->>'id',
+        COALESCE(NULLIF(src.raw->>'loanId',''), NULLIF(src.raw->>'loan_id','')),
+        NULLIF(COALESCE(src.raw->>'scheduleId', src.raw->>'schedule_id'),'') ,
+        NULLIF(COALESCE(src.raw->>'date', src.raw->>'paymentDate', src.raw->>'payment_date'),'')::date,
+        COALESCE(NULLIF(src.raw->>'principal','')::numeric, 0),
+        COALESCE(NULLIF(src.raw->>'interest','')::numeric, 0),
+        COALESCE(NULLIF(src.raw->>'penalty','')::numeric, 0),
+        COALESCE(NULLIF(src.raw->>'total','')::numeric, 0),
+        src.raw->>'mode', src.raw->>'notes',
+        NULLIF(COALESCE(src.raw->>'createdAt', src.raw->>'created_at'),'')::timestamptz,
+        NULLIF(COALESCE(src.raw->>'activityCreatedAt', src.raw->>'activity_created_at'),'')::timestamptz,
+        src.raw
       FROM jsonb_array_elements($1::jsonb) AS src(raw)
-      CROSS JOIN LATERAL jsonb_to_record(src.raw) AS r(
-        id text, loan_id text, schedule_id text, payment_date text, principal numeric, interest numeric, penalty numeric, total numeric,
-        mode text, notes text, created_at text, activity_created_at text
-      )`, [j(source.payments)]);
+      WHERE NULLIF(src.raw->>'id','') IS NOT NULL
+    `, [j(source.payments)]);
 
     await client.query(`
       INSERT INTO blacklist (id, customer_id, reason, blacklist_date, notes, outstanding, created_at, data_json)
-      SELECT r.id, r.customer_id, r.reason, NULLIF(r.blacklist_date,'')::date, r.notes, COALESCE(r.outstanding,0), NULLIF(r.created_at,'')::timestamptz, src.raw
+      SELECT
+        src.raw->>'id',
+        COALESCE(NULLIF(src.raw->>'customerId',''), NULLIF(src.raw->>'customer_id','')),
+        src.raw->>'reason',
+        NULLIF(COALESCE(src.raw->>'date', src.raw->>'blacklistDate', src.raw->>'blacklist_date'),'')::date,
+        src.raw->>'notes', COALESCE(NULLIF(src.raw->>'outstanding','')::numeric,0),
+        NULLIF(COALESCE(src.raw->>'createdAt', src.raw->>'created_at'),'')::timestamptz,
+        src.raw
       FROM jsonb_array_elements($1::jsonb) AS src(raw)
-      CROSS JOIN LATERAL jsonb_to_record(src.raw) AS r(id text, customer_id text, reason text, blacklist_date text, notes text, outstanding numeric, created_at text)
+      WHERE NULLIF(src.raw->>'id','') IS NOT NULL
     `, [j(source.blacklist)]);
 
     await client.query(`
       INSERT INTO notifications (id, customer_id, type, title, message, read, created_at, data_json)
-      SELECT r.id, NULLIF(r.customer_id,''), r.type, r.title, r.message, COALESCE(r.read,false), NULLIF(r.created_at,'')::timestamptz, src.raw
+      SELECT
+        src.raw->>'id',
+        NULLIF(COALESCE(src.raw->>'customerId', src.raw->>'customer_id'),'') ,
+        src.raw->>'type', src.raw->>'title', src.raw->>'message',
+        COALESCE(NULLIF(src.raw->>'read','')::boolean, false),
+        NULLIF(COALESCE(src.raw->>'createdAt', src.raw->>'created_at'),'')::timestamptz,
+        src.raw
       FROM jsonb_array_elements($1::jsonb) AS src(raw)
-      CROSS JOIN LATERAL jsonb_to_record(src.raw) AS r(id text, customer_id text, type text, title text, message text, read boolean, created_at text)
+      WHERE NULLIF(src.raw->>'id','') IS NOT NULL
     `, [j(source.notifications)]);
 
     await client.query(`
       INSERT INTO deleted_records (id, record_type, record_id, deleted_at, deleted_by, data_json)
-      SELECT r.id, r.record_type, r.record_id, NULLIF(r.deleted_at,'')::timestamptz, r.deleted_by, src.raw
+      SELECT
+        src.raw->>'id',
+        COALESCE(NULLIF(src.raw->>'recordType',''), NULLIF(src.raw->>'record_type','')),
+        COALESCE(NULLIF(src.raw->>'recordId',''), NULLIF(src.raw->>'record_id','')),
+        NULLIF(COALESCE(src.raw->>'deletedAt', src.raw->>'deleted_at'),'')::timestamptz,
+        COALESCE(NULLIF(src.raw->>'deletedBy',''), NULLIF(src.raw->>'deleted_by','')),
+        src.raw
       FROM jsonb_array_elements($1::jsonb) AS src(raw)
-      CROSS JOIN LATERAL jsonb_to_record(src.raw) AS r(id text, record_type text, record_id text, deleted_at text, deleted_by text)
+      WHERE NULLIF(src.raw->>'id','') IS NOT NULL
     `, [j(source.deletedRecords)]);
 
     await client.query(`
       INSERT INTO expired_customers (id, customer_id, reason, expired_date, notes, data_json)
-      SELECT r.id, r.customer_id, r.reason, NULLIF(r.expired_date,'')::date, r.notes, src.raw
+      SELECT
+        src.raw->>'id',
+        COALESCE(NULLIF(src.raw->>'customerId',''), NULLIF(src.raw->>'customer_id','')),
+        COALESCE(NULLIF(src.raw->>'reason',''), NULLIF(src.raw->>'status','')),
+        NULLIF(COALESCE(src.raw->>'date', src.raw->>'expiredDate', src.raw->>'expired_date'),'')::date,
+        src.raw->>'notes', src.raw
       FROM jsonb_array_elements($1::jsonb) AS src(raw)
-      CROSS JOIN LATERAL jsonb_to_record(src.raw) AS r(id text, customer_id text, reason text, expired_date text, notes text)
+      WHERE NULLIF(src.raw->>'id','') IS NOT NULL
     `, [j(source.expiredCustomers)]);
 
     await client.query(

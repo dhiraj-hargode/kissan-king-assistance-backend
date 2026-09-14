@@ -1855,7 +1855,7 @@ async function api(req, res) {
     const loanId = String(url.searchParams.get('loanId') || '').trim();
     const offset = (page - 1) * limit;
 
-    const filterParams = [search, from || null, to || null, mode || null, customerId || null, loanId || null];
+    const filterParams = [search, from || null, to || null, mode || '', customerId || '', loanId || ''];
     const filterSql = `
       FROM payments p
       JOIN loans l ON l.id = p.loan_id

@@ -108,11 +108,8 @@ function positive(v) {
 }
 
 function integrity(data) {
-  // Keep validation linear in the size of the dataset. The previous implementation
-  // repeatedly scanned customers/payments/schedules for every record, which became
-  // very expensive with 1,000 customers, 6,520 loans and 29,000+ payments.
   const e = [], cs = new Set(), ls = new Set(), kh = new Set();
-  const customerMobiles = new Map();
+  const customerMobileCounts = new Map();
   const loanMap = new Map();
   const scheduleMap = new Map();
   const principalByLoan = new Map();
@@ -126,11 +123,10 @@ function integrity(data) {
     if (!String(c.city || '').trim()) e.push('Customer ' + id + ' has no city');
     if (!String(c.district || '').trim()) e.push('Customer ' + id + ' has no district');
     const m = String(c.mobile || '');
-    customerMobiles.set(m, (customerMobiles.get(m) || 0) + 1);
+    customerMobileCounts.set(m, (customerMobileCounts.get(m) || 0) + 1);
   }
-
-  for (const [mobile, count] of customerMobiles) {
-    if (count > 1) e.push('Duplicate customer mobile: ' + mobile);
+  for (const [m, count] of customerMobileCounts) {
+    if (count > 1) e.push('Duplicate customer mobile: ' + m);
   }
 
   for (const l of data.loans) {
@@ -147,28 +143,25 @@ function integrity(data) {
     else kh.add(k);
   }
 
-  for (const s of data.schedules) {
-    const id = String(s.id);
-    scheduleMap.set(id, s);
-    if (!ls.has(String(s.loanId))) e.push('Schedule ' + id + ' references missing loan');
-    if (!validDate(s.dueDate)) e.push('Schedule ' + id + ' has invalid due date');
+  for (const sc of data.schedules) {
+    const id = String(sc.id);
+    scheduleMap.set(id, sc);
+    if (!ls.has(String(sc.loanId))) e.push('Schedule ' + id + ' references missing loan');
+    if (!validDate(sc.dueDate)) e.push('Schedule ' + id + ' has invalid due date');
   }
 
-  // First pass: aggregate principal by loan in O(payments).
+  // Validate payment totals and references in linear time. The old
+  // implementation repeatedly filtered/scanned all payments for every payment,
+  // which became O(n²) with 29k+ payment records and made mutations take many
+  // seconds. Accumulate principal by loan in one pass instead.
   for (const p of data.payments) {
-    const loanId = String(p.loanId);
-    const principal = Number(p.principal || 0);
-    principalByLoan.set(loanId, (principalByLoan.get(loanId) || 0) + principal);
-  }
-
-  for (const p of data.payments) {
-    const id = String(p.id);
+    const paymentId = String(p.id);
     const loanId = String(p.loanId);
     const loan = loanMap.get(loanId);
-    if (!loan) e.push('Payment ' + id + ' references missing loan');
-    if (!validDate(p.date)) e.push('Payment ' + id + ' has invalid date');
+    if (!loan) e.push('Payment ' + paymentId + ' references missing loan');
+    if (!validDate(p.date)) e.push('Payment ' + paymentId + ' has invalid date');
     if (loan && validDate(loan.startDate) && validDate(p.date) && p.date < loan.startDate) {
-      e.push('Payment ' + id + ' is before loan start date');
+      e.push('Payment ' + paymentId + ' is before loan start date');
     }
 
     const principal = Number(p.principal || 0);
@@ -176,23 +169,23 @@ function integrity(data) {
     const penalty = Number(p.penalty || 0);
     const t = principal + interest + penalty;
     if (![principal, interest, penalty, t].every(Number.isFinite) || principal < 0 || interest < 0 || penalty < 0) {
-      e.push('Payment ' + id + ' has invalid amounts');
+      e.push('Payment ' + paymentId + ' has invalid amounts');
     }
-    if (Math.abs(t - Number(p.total || 0)) > 0.01) e.push('Payment ' + id + ' total mismatch');
+    if (Math.abs(t - Number(p.total || 0)) > 0.01) e.push('Payment ' + paymentId + ' total mismatch');
 
-    if (loan) {
-      // The aggregate includes this payment; compare the complete principal sum once.
-      // The per-payment error message is retained for compatibility.
-      const totalPrincipal = principalByLoan.get(loanId) || 0;
-      if (totalPrincipal > Number(loan.amount) + 0.01) {
-        e.push('Payment ' + id + ' exceeds loan principal');
-      }
-    }
+    if (loan) principalByLoan.set(loanId, (principalByLoan.get(loanId) || 0) + principal);
 
     if (p.scheduleId) {
       const sc = scheduleMap.get(String(p.scheduleId));
-      if (!sc) e.push('Payment ' + id + ' references missing schedule');
-      else if (String(sc.loanId) !== loanId) e.push('Payment ' + id + ' schedule does not belong to loan');
+      if (!sc) e.push('Payment ' + paymentId + ' references missing schedule');
+      else if (String(sc.loanId) !== loanId) e.push('Payment ' + paymentId + ' schedule does not belong to loan');
+    }
+  }
+
+  for (const [loanId, principal] of principalByLoan) {
+    const loan = loanMap.get(loanId);
+    if (loan && principal > Number(loan.amount) + 0.01) {
+      e.push('Payments for loan ' + loanId + ' exceed loan principal');
     }
   }
 
@@ -202,7 +195,6 @@ function integrity(data) {
 
   return e;
 }
-
 function diff(before, after, key) {
   const b = new Map((before[key] || []).map(x => [String(x.id), x]));
   const a = new Map((after[key] || []).map(x => [String(x.id), x]));

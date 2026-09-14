@@ -927,6 +927,202 @@ function monthlyDateServer(start, n) {
   return `${y}-${String(m + 1).padStart(2, '0')}-${String(Math.min(d.getDate(), last)).padStart(2, '0')}`;
 }
 
+
+function isoDateFromQuery(value) {
+  const v = String(value || '').trim();
+  return /^\d{4}-\d{2}-\d{2}$/.test(v) ? v : new Date().toISOString().slice(0, 10);
+}
+
+function dashboardCustomerName(c) {
+  return [c?.firstName, c?.middleName, c?.lastName].filter(Boolean).join(' ') || String(c?.name || c?.id || '');
+}
+
+function buildDashboardData(data, asOf, range = '6m') {
+  const today = isoDateFromQuery(asOf);
+  const customers = Array.isArray(data.customers) ? data.customers : [];
+  const loans = Array.isArray(data.loans) ? data.loans : [];
+  const schedules = Array.isArray(data.schedules) ? data.schedules : [];
+  const payments = Array.isArray(data.payments) ? data.payments : [];
+  const expiredIds = new Set((data.expiredCustomers || []).map(x => String(x.customerId)));
+  const customerById = new Map(customers.map(c => [String(c.id), c]));
+  const loanById = new Map(loans.map(l => [String(l.id), l]));
+  const paymentsByLoan = new Map();
+  const paymentsBySchedule = new Map();
+  const paymentsByLoanDate = new Map();
+  const paidPrincipalByLoan = new Map();
+
+  for (const p of payments) {
+    const loanId = String(p.loanId || '');
+    if (!paymentsByLoan.has(loanId)) paymentsByLoan.set(loanId, []);
+    paymentsByLoan.get(loanId).push(p);
+    const sid = String(p.scheduleId || '').trim();
+    if (sid) {
+      if (!paymentsBySchedule.has(sid)) paymentsBySchedule.set(sid, []);
+      paymentsBySchedule.get(sid).push(p);
+    }
+    const dateKey = loanId + '|' + String(p.date || '');
+    if (!paymentsByLoanDate.has(dateKey)) paymentsByLoanDate.set(dateKey, []);
+    paymentsByLoanDate.get(dateKey).push(p);
+    paidPrincipalByLoan.set(loanId, (paidPrincipalByLoan.get(loanId) || 0) + Number(p.principal || 0));
+  }
+
+  const isExpired = id => expiredIds.has(String(id));
+  const activeCustomer = id => !isExpired(id);
+  const loanOutstanding = l => Math.max(0, Number(l?.amount || 0) - (paidPrincipalByLoan.get(String(l?.id)) || 0));
+  const schedulePayments = s => {
+    const sid = String(s?.id || '');
+    const direct = sid ? (paymentsBySchedule.get(sid) || []) : [];
+    if (direct.length) return direct;
+    return paymentsByLoanDate.get(String(s?.loanId || '') + '|' + String(s?.dueDate || '')) || [];
+  };
+  const effectivePaid = s => {
+    const total = schedulePayments(s).reduce((a, p) => a + Number(p.principal || 0) + Number(p.interest || 0), 0);
+    return Math.max(Number(s?.paid || 0), total);
+  };
+  const effectiveDue = s => {
+    const installment = Math.max(0, Number(s?.emi || 0) - effectivePaid(s));
+    const penaltyPaid = schedulePayments(s).reduce((a, p) => a + Number(p.penalty || 0), 0);
+    const unpaidPenalty = Math.max(0, Number(s?.penalty || 0) - penaltyPaid);
+    return Number((installment + unpaidPenalty).toFixed(2));
+  };
+  const daysBetween = (a, b) => {
+    const x = new Date(String(a) + 'T00:00:00');
+    const y = new Date(String(b) + 'T00:00:00');
+    return Number.isNaN(x.getTime()) || Number.isNaN(y.getTime()) ? 0 : Math.round((y - x) / 86400000);
+  };
+
+  const activeCustomers = customers.filter(c => activeCustomer(c.id));
+  const activeLoans = loans.filter(l => activeCustomer(l.customerId));
+  const completedLoans = activeLoans.filter(l => loanOutstanding(l) <= 0.005);
+  const lent = activeLoans.reduce((a, l) => a + Number(l.amount || 0), 0);
+  const remaining = activeLoans.reduce((a, l) => a + loanOutstanding(l), 0);
+  const allTimeInterest = payments.reduce((a, p) => a + Number(p.interest || 0), 0);
+
+  const todaysPayments = payments.filter(p => String(p.date || '') === today && loanById.has(String(p.loanId)));
+  const activeSchedulesToday = schedules.filter(s => activeCustomer(s.customerId) && String(s.dueDate || '') === today);
+  const todayScheduleIds = new Set(activeSchedulesToday.map(s => String(s.id)));
+  const todayLoanIds = new Set(activeSchedulesToday.map(s => String(s.loanId)));
+  const dueTodayPayments = todaysPayments.filter(p => p.scheduleId ? todayScheduleIds.has(String(p.scheduleId)) : todayLoanIds.has(String(p.loanId)));
+  const overduePaymentsToday = todaysPayments.filter(p => !dueTodayPayments.includes(p));
+
+  const grouped = new Map();
+  for (const s of activeSchedulesToday) {
+    const key = String(s.loanId);
+    if (!grouped.has(key)) grouped.set(key, []);
+    grouped.get(key).push(s);
+  }
+
+  const dueTodayRows = [];
+  for (const [loanId, ss] of grouped) {
+    const loan = loanById.get(loanId);
+    if (!loan) continue;
+    const scheduledAmount = ss.reduce((sum, s) => sum + Number(s.emi || 0) + Number(s.penalty || 0), 0);
+    const due = ss.reduce((sum, s) => sum + effectiveDue(s), 0);
+    const relevantPayments = todaysPayments.filter(p => String(p.loanId) === loanId && (ss.some(x => String(x.id) === String(p.scheduleId || '')) || (!p.scheduleId && ss.some(x => String(x.dueDate) === String(p.date)))));
+    const paidOnDate = relevantPayments.reduce((sum, p) => sum + Number(p.total || 0), 0);
+    const fullyPaid = ss.every(s => effectiveDue(s) <= 0.005);
+    const remainingDue = fullyPaid ? 0 : Math.max(0, due - paidOnDate);
+    dueTodayRows.push({ loanId, loan, customer: customerById.get(String(loan.customerId)) || null, schedules: ss, due: remainingDue, grossDue: Math.max(scheduledAmount, due), paidOnDate, fullyPaid });
+  }
+
+  const expected = dueTodayRows.reduce((a, r) => a + Number(r.grossDue || 0), 0);
+  const collected = todaysPayments.reduce((a, p) => a + Number(p.total || 0), 0);
+  const principalToday = todaysPayments.reduce((a, p) => a + Number(p.principal || 0), 0);
+  const interestToday = todaysPayments.reduce((a, p) => a + Number(p.interest || 0), 0);
+  const penaltyToday = todaysPayments.reduce((a, p) => a + Number(p.penalty || 0), 0);
+  const dueTodayCollected = dueTodayPayments.reduce((a, p) => a + Number(p.total || 0), 0);
+  const overdueCollectedToday = overduePaymentsToday.reduce((a, p) => a + Number(p.total || 0), 0);
+  const overdue = schedules.filter(s => activeCustomer(s.customerId) && String(s.dueDate || '') < today && effectiveDue(s) > 0.005);
+  const overdueAmount = overdue.reduce((a, s) => a + effectiveDue(s), 0);
+
+  const deceasedLoans = loans.filter(l => isExpired(l.customerId));
+  const deceasedOutstanding = deceasedLoans.reduce((a, l) => a + loanOutstanding(l), 0);
+  const deceasedOverdue = schedules.filter(s => isExpired(s.customerId) && String(s.dueDate || '') < today && effectiveDue(s) > 0.005);
+  const deceasedOverdueAmount = deceasedOverdue.reduce((a, s) => a + effectiveDue(s), 0);
+
+  const pendingIds = new Set((data.pendingQueue || []).map(String));
+  const pendingOverdue = schedules.filter(s => activeCustomer(s.customerId) && pendingIds.has(String(s.id)) && s.pendingAddedAt && loanOutstanding(loanById.get(String(s.loanId))) > 0.005 && String(loanById.get(String(s.loanId))?.status || 'ACTIVE').toUpperCase() !== 'CLOSED' && String(s.dueDate || '') < today && effectiveDue(s) > 0.005);
+  const topMap = new Map();
+  for (const s of pendingOverdue) {
+    const loan = loanById.get(String(s.loanId));
+    const customer = loan ? customerById.get(String(loan.customerId)) : null;
+    if (!loan || !customer) continue;
+    const key = String(customer.id);
+    const item = topMap.get(key) || { customer, amount: 0, days: 0, count: 0 };
+    item.amount += effectiveDue(s);
+    item.days = Math.max(item.days, Math.max(0, daysBetween(s.dueDate, today)));
+    item.count += 1;
+    topMap.set(key, item);
+  }
+  const topOverdue = [...topMap.values()].sort((a,b) => b.amount - a.amount).slice(0, 5);
+
+  const risk = { '1–7 Days': 0, '8–30 Days': 0, '31–60 Days': 0, '60+ Days': 0 };
+  for (const s of overdue) {
+    const days = Math.max(1, daysBetween(s.dueDate, today));
+    if (days <= 7) risk['1–7 Days']++;
+    else if (days <= 30) risk['8–30 Days']++;
+    else if (days <= 60) risk['31–60 Days']++;
+    else risk['60+ Days']++;
+  }
+
+  const activity = [];
+  const seen = new Set();
+  const addActivity = (e, key) => {
+    if (e.date !== today || seen.has(key)) return;
+    seen.add(key); activity.push({ ...e, sortTime: e.createdAt || `${e.date}T00:00:00` });
+  };
+  for (const p of todaysPayments) {
+    const l = loanById.get(String(p.loanId));
+    const c = l ? customerById.get(String(l.customerId)) : null;
+    addActivity({ date: p.date, createdAt: p.createdAt || p.activityCreatedAt, type: 'payment', title: 'Payment received', detail: `${dashboardCustomerName(c)} · ${l?.id || ''}`, amount: Number(p.total || 0) }, `payment:${p.id}`);
+  }
+  for (const l of loans) {
+    const c = customerById.get(String(l.customerId)); const created = l.createdAt || l.activityCreatedAt || '';
+    addActivity({ date: String(created).slice(0,10), createdAt: created, type: 'loan', title: 'New loan created', detail: `${dashboardCustomerName(c)} · ${l.id}`, amount: Number(l.amount || 0) }, `loan:${l.id}`);
+  }
+  for (const c of customers) {
+    const created = c.createdAt || c.activityCreatedAt || '';
+    addActivity({ date: String(created).slice(0,10), createdAt: created, type: 'customer', title: 'Customer registered', detail: dashboardCustomerName(c), amount: null }, `customer:${c.id}`);
+  }
+  for (const b of data.blacklist || []) {
+    const c = customerById.get(String(b.customerId));
+    addActivity({ date: b.date, createdAt: b.createdAt || b.date, type: 'risk', title: 'Customer blacklisted', detail: dashboardCustomerName(c) || String(b.customerId), amount: null }, `blacklist:${b.id || b.customerId}`);
+  }
+  for (const x of data.expiredCustomers || []) {
+    const c = customerById.get(String(x.customerId));
+    addActivity({ date: x.date, createdAt: x.createdAt || x.date, type: 'risk', title: 'Customer marked expired/deceased', detail: dashboardCustomerName(c) || String(x.customerId), amount: null }, `expired:${x.id || x.customerId}`);
+  }
+  activity.sort((a,b) => (Date.parse(b.sortTime || '') || 0) - (Date.parse(a.sortTime || '') || 0));
+
+  const validPayments = payments.filter(p => loanById.has(String(p.loanId)) && /^\d{4}-\d{2}-\d{2}$/.test(String(p.date || '')));
+  const trend = [];
+  const now = new Date(today + 'T12:00:00');
+  const monthKey = d => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`;
+  const dayKey = d => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+  const sumPayments = (from, to) => validPayments.reduce((sum,p) => { const d = new Date(String(p.date) + 'T00:00:00'); return d >= from && d <= to ? sum + Number(p.total || 0) : sum; }, 0);
+  if (range === '7d') {
+    for (let i=6;i>=0;i--) { const d=new Date(now); d.setDate(d.getDate()-i); const key=dayKey(d); trend.push({ key, label:d.toLocaleString('en-IN',{day:'2-digit',month:'short'}), total:sumPayments(new Date(key+'T00:00:00'),new Date(key+'T23:59:59')) }); }
+  } else if (range === '30d') {
+    for (let i=5;i>=0;i--) { const end=new Date(now); end.setDate(end.getDate()-i*5); const key=dayKey(end); const from=new Date(key+'T00:00:00'); const to=new Date(from); to.setDate(to.getDate()+4); trend.push({ key, label:end.toLocaleString('en-IN',{day:'2-digit',month:'short'}), total:sumPayments(from,to) }); }
+  } else {
+    const count = range === '1y' ? 12 : 6;
+    for (let i=count-1;i>=0;i--) { const d=new Date(now.getFullYear(),now.getMonth()-i,1); const key=monthKey(d); const from=new Date(d.getFullYear(),d.getMonth(),1); const to=new Date(d.getFullYear(),d.getMonth()+1,0,23,59,59); trend.push({ key, label:d.toLocaleString('en-IN',{month:'short'}), total:sumPayments(from,to) }); }
+  }
+
+  return {
+    asOf: today,
+    counts: { customers: activeCustomers.length, loans: activeLoans.length, activeLoans: activeLoans.filter(l => loanOutstanding(l) > 0).length, completedLoans: completedLoans.length },
+    portfolio: { lent, outstanding: remaining, interest: allTimeInterest },
+    collection: { expected, collected, dueTodayCollected, interestToday, principalToday, penaltyToday, overdueCollectedToday, overdueAmount, collectionPct: expected > 0 ? (dueTodayCollected / expected) * 100 : 0 },
+    dueTodayRows: dueTodayRows.map(r => ({ loanId:r.loanId, loan:r.loan, customer:r.customer, schedules:r.schedules, due:r.due, grossDue:r.grossDue, paidOnDate:r.paidOnDate, fullyPaid:r.fullyPaid })),
+    topOverdue,
+    risk,
+    activity: activity.slice(0,8),
+    specialCases: { loans: deceasedLoans.length, outstanding: deceasedOutstanding, overdue: deceasedOverdueAmount },
+    trend
+  };
+}
+
 async function api(req, res) {
   const parts = pathParts(req.url);
   const method = req.method || 'GET';
@@ -943,14 +1139,24 @@ async function api(req, res) {
   if (parts[0] !== 'api') return false;
 
   if (method === 'GET' && parts[1] === 'public' && parts[2] === 'branding') {
-    const d = await userData();
+    const r = await db.query(`
+      SELECT COALESCE(data_json->'settings', '{}'::jsonb) AS settings
+      FROM user_data WHERE user_id = $1`, [SHARED_DATA_ID]);
+    const settings = r.rows[0]?.settings || {};
     return send(res, 200, {
       branding: {
-        appName: String(d.settings?.appName || 'Loan Management'),
-        logoData: String(d.settings?.logoData || ''),
-        logoEnabled: d.settings?.logoEnabled !== false
+        appName: String(settings.appName || 'Loan Management'),
+        logoData: String(settings.logoData || ''),
+        logoEnabled: settings.logoEnabled !== false
       }
     });
+  }
+
+  if (method === 'GET' && parts[1] === 'dashboard') {
+    const d = await userData();
+    const asOf = isoDateFromQuery(new URL(req.url, 'http://localhost').searchParams.get('date'));
+    const range = String(new URL(req.url, 'http://localhost').searchParams.get('range') || '6m');
+    return send(res, 200, { dashboard: buildDashboardData(d, asOf, ['7d','30d','6m','1y'].includes(range) ? range : '6m'), user: u });
   }
 
   if (parts[1] === 'auth') {

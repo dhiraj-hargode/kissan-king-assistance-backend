@@ -1559,6 +1559,144 @@ async function api(req, res) {
     });
   }
 
+
+  // Paginated overdue-installment list. This is separate from the explicit
+  // Pending queue because Overdue Loans historically includes every overdue
+  // unpaid schedule, whether or not it was manually added to Pending.
+  if (method === 'GET' && parts[1] === 'overdue' && !parts[2]) {
+    const u=await sessionUser(req); if(!u)return send(res,401,{error:'Authentication required'});
+    const url=new URL(req.url,'http://localhost');
+    const page=Math.max(1,Number.parseInt(url.searchParams.get('page')||'1',10)||1);
+    const limit=Math.min(100,Math.max(1,Number.parseInt(url.searchParams.get('limit')||'50',10)||50));
+    const search=String(url.searchParams.get('search')||'').trim().toLowerCase().slice(0,100);
+    const date=isoDateFromQuery(url.searchParams.get('date'));
+    const d=await userData(u.userId),customers=Array.isArray(d.customers)?d.customers:[],loans=Array.isArray(d.loans)?d.loans:[],schedules=Array.isArray(d.schedules)?d.schedules:[],payments=Array.isArray(d.payments)?d.payments:[];
+    const expiredIds=new Set((d.expiredCustomers||[]).map(x=>String(x.customerId||x.id||''))),byId=new Map(customers.map(c=>[String(c.id),c])),loanById=new Map(loans.map(l=>[String(l.id),l])),paidBySchedule=new Map(),paidByLoan=new Map();
+    for(const pay of payments){const sid=String(pay.scheduleId||'');const lid=String(pay.loanId||'');const total=Number(pay.total||0);if(sid)paidBySchedule.set(sid,(paidBySchedule.get(sid)||0)+total);if(lid)paidByLoan.set(lid,(paidByLoan.get(lid)||0)+Number(pay.principal||0));}
+    const rows=[];
+    for(const sch of schedules){const loan=loanById.get(String(sch.loanId));if(!loan||expiredIds.has(String(loan.customerId)))continue;const customer=byId.get(String(loan.customerId))||{};const scheduled=Math.max(0,Number(sch.emi||0));const paid=Math.max(Number(sch.paid||0),paidBySchedule.get(String(sch.id))||0);const pending=Math.max(0,scheduled-paid);if(!String(sch.dueDate||'')||String(sch.dueDate)>=date||pending<=0.005)continue;const hay=[loan.id,loan.khataNo,loan.legacyKhataNo,loan.customerId,customer.id,customer.firstName,customer.middleName,customer.lastName,customer.name,customer.mobile].join(' ').toLowerCase();if(search&&!hay.includes(search))continue;rows.push({schedule:sch,loan,customer,pending,daysLate:Math.max(0,Math.floor((new Date(date+'T00:00:00')-new Date(String(sch.dueDate)+'T00:00:00'))/86400000)),status:'OVERDUE'});}
+    rows.sort((a,b)=>String(a.schedule.dueDate).localeCompare(String(b.schedule.dueDate)));
+    const total=rows.length,totalPages=Math.max(1,Math.ceil(total/limit)),safePage=Math.min(page,totalPages),start=(safePage-1)*limit;
+    return send(res,200,{rows:rows.slice(start,start+limit),pagination:{page:safePage,limit,total,totalPages,hasNext:safePage<totalPages,hasPrevious:safePage>1},user:u});
+  }
+
+  // Paginated blacklist list. Uses the existing JSONB store for now; Phase 3
+  // can move this contract to a normalized PostgreSQL table.
+  if (method === 'GET' && parts[1] === 'blacklist' && !parts[2]) {
+    const u = await sessionUser(req);
+    if (!u) return send(res, 401, { error: 'Authentication required' });
+    const url = new URL(req.url, 'http://localhost');
+    const page = Math.max(1, Number.parseInt(url.searchParams.get('page') || '1', 10) || 1);
+    const limit = Math.min(100, Math.max(1, Number.parseInt(url.searchParams.get('limit') || '50', 10) || 50));
+    const search = String(url.searchParams.get('search') || '').trim().toLowerCase().slice(0, 100);
+    const d = await userData(u.userId);
+    const customers = Array.isArray(d.customers) ? d.customers : [];
+    const loans = Array.isArray(d.loans) ? d.loans : [];
+    const blacklist = Array.isArray(d.blacklist) ? d.blacklist : [];
+    const customerById = new Map(customers.map(c => [String(c.id), c]));
+    const loansByCustomer = new Map();
+    for (const l of loans) {
+      const cid = String(l.customerId || '');
+      if (!loansByCustomer.has(cid)) loansByCustomer.set(cid, []);
+      loansByCustomer.get(cid).push(l);
+    }
+    const rows = blacklist.map(b => {
+      const customer = customerById.get(String(b.customerId));
+      if (!customer) return null;
+      const customerLoans = loansByCustomer.get(String(customer.id)) || [];
+      const hay = [customer.id, customer.firstName, customer.middleName, customer.lastName, customer.name, customer.mobile, customer.city, b.reason, b.notes].join(' ').toLowerCase();
+      if (search && !hay.includes(search)) return null;
+      return { blacklist: b, customer, loanCount: customerLoans.length, outstanding: customerLoans.reduce((sum, l) => sum + Math.max(0, Number(l.amount || 0)), 0) };
+    }).filter(Boolean);
+    rows.sort((a,b) => String(a.customer.firstName || a.customer.name || a.customer.id).localeCompare(String(b.customer.firstName || b.customer.name || b.customer.id), undefined, {sensitivity:'base'}));
+    const total = rows.length, totalPages = Math.max(1, Math.ceil(total / limit)), safePage = Math.min(page, totalPages), start=(safePage-1)*limit;
+    return send(res, 200, { rows: rows.slice(start,start+limit), pagination:{page:safePage,limit,total,totalPages,hasNext:safePage<totalPages,hasPrevious:safePage>1}, user:u });
+  }
+
+  // Paginated expired/deceased customer list.
+  if (method === 'GET' && parts[1] === 'expired-people' && !parts[2]) {
+    const u = await sessionUser(req);
+    if (!u) return send(res, 401, { error: 'Authentication required' });
+    const url = new URL(req.url, 'http://localhost');
+    const page = Math.max(1, Number.parseInt(url.searchParams.get('page') || '1', 10) || 1);
+    const limit = Math.min(100, Math.max(1, Number.parseInt(url.searchParams.get('limit') || '50', 10) || 50));
+    const search = String(url.searchParams.get('search') || '').trim().toLowerCase().slice(0, 100);
+    const d = await userData(u.userId);
+    const customers = Array.isArray(d.customers) ? d.customers : [];
+    const loans = Array.isArray(d.loans) ? d.loans : [];
+    const expired = Array.isArray(d.expiredCustomers) ? d.expiredCustomers : [];
+    const customerById = new Map(customers.map(c => [String(c.id), c]));
+    const loansByCustomer = new Map();
+    for (const l of loans) { const cid=String(l.customerId||''); if(!loansByCustomer.has(cid)) loansByCustomer.set(cid,[]); loansByCustomer.get(cid).push(l); }
+    const rows = expired.map(ex => {
+      const cid=String(ex.customerId || ex.id || ''), customer=customerById.get(cid); if(!customer)return null;
+      const hay=[customer.id,customer.firstName,customer.middleName,customer.lastName,customer.name,customer.mobile,customer.city].join(' ').toLowerCase();
+      if(search && !hay.includes(search))return null;
+      const customerLoans=loansByCustomer.get(cid)||[];
+      return { expired:ex, customer, loanCount:customerLoans.length, outstanding:customerLoans.reduce((sum,l)=>sum+Math.max(0,Number(l.amount||0)),0) };
+    }).filter(Boolean);
+    rows.sort((a,b)=>String(b.expired.date||'').localeCompare(String(a.expired.date||'')));
+    const total=rows.length,totalPages=Math.max(1,Math.ceil(total/limit)),safePage=Math.min(page,totalPages),start=(safePage-1)*limit;
+    return send(res,200,{rows:rows.slice(start,start+limit),pagination:{page:safePage,limit,total,totalPages,hasNext:safePage<totalPages,hasPrevious:safePage>1},user:u});
+  }
+
+  // Targeted schedule search. Returns only matching loans; selecting one can
+  // reuse the existing /api/loans/:id detail endpoint.
+  if (method === 'GET' && parts[1] === 'schedule' && parts[2] === 'search') {
+    const u = await sessionUser(req);
+    if (!u) return send(res,401,{error:'Authentication required'});
+    const url=new URL(req.url,'http://localhost');
+    const q=String(url.searchParams.get('q')||'').trim().toLowerCase().slice(0,100);
+    if(!q) return send(res,200,{loans:[],user:u});
+    const d=await userData(u.userId), customers=Array.isArray(d.customers)?d.customers:[], loans=Array.isArray(d.loans)?d.loans:[];
+    const expiredIds=new Set((d.expiredCustomers||[]).map(x=>String(x.customerId||x.id||'')));
+    const byId=new Map(customers.map(c=>[String(c.id),c]));
+    const rows=loans.filter(l=>!expiredIds.has(String(l.customerId))).map(l=>{const c=byId.get(String(l.customerId))||{};const name=[c.firstName,c.middleName,c.lastName].filter(Boolean).join(' ')||c.name||'';return {loan:l,customer:c,name};}).filter(r=>[r.loan.id,r.loan.customerId,r.loan.khataNo,r.loan.legacyKhataNo,r.name,r.customer.mobile].join(' ').toLowerCase().includes(q)).slice(0,20);
+    return send(res,200,{loans:rows,user:u});
+  }
+
+  // Server-side report/analytics aggregation. The browser receives only the
+  // selected year's 12 monthly rows and KPI values instead of all payments.
+  if (method === 'GET' && (parts[1] === 'reports' || parts[1] === 'analytics') && !parts[2]) {
+    const u=await sessionUser(req); if(!u)return send(res,401,{error:'Authentication required'});
+    const url=new URL(req.url,'http://localhost');
+    const requested=Number.parseInt(url.searchParams.get('year')||'',10);
+    const d=await userData(u.userId);
+    const customers=Array.isArray(d.customers)?d.customers:[], loans=Array.isArray(d.loans)?d.loans:[], payments=Array.isArray(d.payments)?d.payments:[];
+    const validPayments=payments.filter(p=>/^\d{4}-\d{2}-\d{2}$/.test(String(p.date||'')) && loans.some(l=>String(l.id)===String(p.loanId)));
+    const years=new Set();
+    const addYear=v=>{const m=String(v||'').match(/^(\d{4})-/);if(m)years.add(Number(m[1]));};
+    customers.forEach(c=>addYear(c.createdAt||c.activityCreatedAt));
+    loans.forEach(l=>addYear(l.startDate||l.loanDate));
+    validPayments.forEach(p=>addYear(p.date));
+    const yearsSorted=[...years].sort((a,b)=>b-a); if(!yearsSorted.length)yearsSorted.push(new Date().getFullYear());
+    const year=yearsSorted.includes(requested)?requested:yearsSorted[0];
+    const monthRows=Array.from({length:12},(_,i)=>{const key=`${year}-${String(i+1).padStart(2,'0')}`;const ls=loans.filter(l=>String(l.startDate||l.loanDate||'').startsWith(key));const ps=validPayments.filter(p=>String(p.date).startsWith(key));return {month:i+1,label:new Date(year,i,1).toLocaleString('en-IN',{month:'short'}),investment:ls.reduce((a,l)=>a+Number(l.amount||0),0),principal:ps.reduce((a,p)=>a+Number(p.principal||0),0),interest:ps.reduce((a,p)=>a+Number(p.interest||0),0),penalty:ps.reduce((a,p)=>a+Number(p.penalty||0),0),total:ps.reduce((a,p)=>a+Number(p.total||0),0),paymentCount:ps.length};});
+    const yearPayments=validPayments.filter(p=>String(p.date).startsWith(String(year)));
+    const paidPrincipalByLoan=new Map(),paymentsByLoan=new Map(); for(const pay of validPayments){const lid=String(pay.loanId);paidPrincipalByLoan.set(lid,(paidPrincipalByLoan.get(lid)||0)+Number(pay.principal||0));if(!paymentsByLoan.has(lid))paymentsByLoan.set(lid,[]);paymentsByLoan.get(lid).push(pay);}
+    for(const list of paymentsByLoan.values()) list.sort((a,b)=>String(a.date).localeCompare(String(b.date)));
+    const completedLoans=loans.filter(l=>{const target=Math.max(0,Number(l.amount||0));if(target<=0)return false;let sum=0,last=null;for(const pay of (paymentsByLoan.get(String(l.id))||[])){sum+=Number(pay.principal||0);if(sum>=target-0.005){last=pay.date;break;}}const completion=l.completedAt||last;return completion&&String(completion).startsWith(String(year));}).length;
+    const newCustomers=customers.filter(c=>String(c.createdAt||c.activityCreatedAt||'').startsWith(String(year))).length;
+    const newLoans=loans.filter(l=>String(l.startDate||l.loanDate||'').startsWith(String(year))).length;
+    const summary={totalPrincipal:yearPayments.reduce((a,p)=>a+Number(p.principal||0),0),totalInterest:yearPayments.reduce((a,p)=>a+Number(p.interest||0),0),totalPenalty:yearPayments.reduce((a,p)=>a+Number(p.penalty||0),0),totalCollection:yearPayments.reduce((a,p)=>a+Number(p.total||0),0),paymentCount:yearPayments.length,investment:monthRows.reduce((a,m)=>a+m.investment,0)};
+    if(parts[1]==='reports') return send(res,200,{year,years:yearsSorted,rows:monthRows,summary,user:u});
+    return send(res,200,{year,years:yearsSorted,summary:{investment:summary.investment,interest:summary.totalInterest,penalty:summary.totalPenalty},months:monthRows.map(m=>({month:m.month,label:m.label,investment:m.investment,interest:m.interest,penalty:m.penalty})),activity:{newCustomers,newLoans,completedLoans},user:u});
+  }
+
+  // Global search returns a small result set rather than filtering the full
+  // database in the browser.
+  if (method === 'GET' && parts[1] === 'search' && !parts[2]) {
+    const u=await sessionUser(req); if(!u)return send(res,401,{error:'Authentication required'});
+    const url=new URL(req.url,'http://localhost'); const q=String(url.searchParams.get('q')||'').trim().toLowerCase().slice(0,100);
+    if(!q)return send(res,200,{customers:[],loans:[],user:u});
+    const d=await userData(u.userId),customers=Array.isArray(d.customers)?d.customers:[],loans=Array.isArray(d.loans)?d.loans:[];
+    const byId=new Map(customers.map(c=>[String(c.id),c]));
+    const active=customers.filter(c=>!(d.expiredCustomers||[]).some(x=>String(x.customerId||x.id)===String(c.id)));
+    const cs=active.filter(c=>[c.id,c.firstName,c.middleName,c.lastName,c.name,c.mobile,c.city].join(' ').toLowerCase().includes(q)).slice(0,8);
+    const ls=loans.filter(l=>{const c=byId.get(String(l.customerId))||{};const name=[c.firstName,c.middleName,c.lastName].filter(Boolean).join(' ')||c.name||'';return [l.id,l.khataNo,l.legacyKhataNo,l.customerId,name,c.mobile].join(' ').toLowerCase().includes(q)}).slice(0,8).map(l=>({loan:l,customer:byId.get(String(l.customerId))||null}));
+    return send(res,200,{customers:cs,loans:ls,user:u});
+  }
+
   if (method === 'GET' && parts[1] === 'customers' && !parts[2]) {
     const u = await sessionUser(req);
     if (!u) return send(res, 401, { error: 'Authentication required' });

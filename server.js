@@ -403,6 +403,39 @@ async function initDb() {
     );
   }
 
+  // Once normalized PostgreSQL is active, the monolithic legacy JSON snapshot
+  // is no longer the business-data source of truth. Keep only application
+  // settings in the shared user_data row and remove any obsolete per-user
+  // business-data snapshots. The normalized tables remain untouched.
+  const normalizedMarker = await db.query(
+    'SELECT 1 FROM app_meta WHERE key = $1',
+    ['normalized_data_v1']
+  );
+  if (normalizedMarker.rows.length) {
+    const before = await db.query(
+      `SELECT COALESCE(SUM(pg_column_size(data_json)), 0)::bigint AS bytes, COUNT(*)::int AS rows
+       FROM user_data`
+    );
+    await db.query(
+      `UPDATE user_data
+       SET data_json = jsonb_build_object('settings', COALESCE(data_json->'settings', '{}'::jsonb)),
+           updated_at = $2
+       WHERE user_id = $1`,
+      [SHARED_DATA_ID, now()]
+    );
+    await db.query(
+      'DELETE FROM user_data WHERE user_id <> $1',
+      [SHARED_DATA_ID]
+    );
+    const after = await db.query(
+      `SELECT COALESCE(SUM(pg_column_size(data_json)), 0)::bigint AS bytes, COUNT(*)::int AS rows
+       FROM user_data`
+    );
+    console.log(
+      `Legacy JSON mirror compacted: ${before.rows[0]?.bytes || 0} bytes/${before.rows[0]?.rows || 0} rows -> ${after.rows[0]?.bytes || 0} bytes/${after.rows[0]?.rows || 0} row (normalized PostgreSQL retained).`
+    );
+  }
+
   console.log('PostgreSQL schema initialized successfully.');
 }
 
@@ -841,12 +874,14 @@ async function saveData(data) {
   try {
     await client.query('BEGIN');
     await syncNormalizedFull(client, normalized);
+    // Keep user_data as a tiny compatibility/settings row only. Business data
+    // is stored in normalized PostgreSQL tables.
     await client.query(
       `INSERT INTO user_data(user_id, data_json, updated_at)
-       VALUES ($1, $2::jsonb, $3)
+       VALUES ($1, jsonb_build_object('settings', $2::jsonb), $3)
        ON CONFLICT (user_id) DO UPDATE
-       SET data_json = EXCLUDED.data_json, updated_at = EXCLUDED.updated_at`,
-      [SHARED_DATA_ID, JSON.stringify(normalized), now()]
+       SET data_json = jsonb_build_object('settings', $2::jsonb), updated_at = EXCLUDED.updated_at`,
+      [SHARED_DATA_ID, JSON.stringify(normalized.settings || blankData().settings), now()]
     );
     await client.query(
       `INSERT INTO app_meta(key, value) VALUES ($1,$2)
@@ -2971,11 +3006,14 @@ async function api(req, res) {
       // use incremental upserts/deletes, avoiding a full-table rewrite on every
       // payment or schedule update.
       await syncNormalizedOperations(client, normalized, operations);
+      // Keep only settings in the compatibility row; never recreate the old
+      // monolithic business-data JSON document after a mutation.
       await client.query(
         `INSERT INTO user_data(user_id, data_json, updated_at)
-         VALUES ($1, $2::jsonb, $3)
-         ON CONFLICT (user_id) DO UPDATE SET data_json = EXCLUDED.data_json, updated_at = EXCLUDED.updated_at`,
-        [SHARED_DATA_ID, JSON.stringify(normalized), now()]
+         VALUES ($1, jsonb_build_object('settings', $2::jsonb), $3)
+         ON CONFLICT (user_id) DO UPDATE
+         SET data_json = jsonb_build_object('settings', $2::jsonb), updated_at = EXCLUDED.updated_at`,
+        [SHARED_DATA_ID, JSON.stringify(normalized.settings || blankData().settings), now()]
       );
       await client.query(
         `INSERT INTO app_meta(key, value) VALUES ($1,$2)

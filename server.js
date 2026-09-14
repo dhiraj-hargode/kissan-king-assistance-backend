@@ -1700,35 +1700,85 @@ async function api(req, res) {
     const u = await sessionUser(req);
     if (!u) return send(res, 401, { error: 'Authentication required' });
     const customerId = decodeURIComponent(parts[2]);
-    const x = await userData(u.userId);
-    const customers = Array.isArray(x.customers) ? x.customers : [];
-    const loans = Array.isArray(x.loans) ? x.loans : [];
-    const payments = Array.isArray(x.payments) ? x.payments : [];
-    const schedules = Array.isArray(x.schedules) ? x.schedules : [];
-    const blacklistRows = Array.isArray(x.blacklist) ? x.blacklist : [];
-    const expiredCustomers = Array.isArray(x.expiredCustomers) ? x.expiredCustomers : [];
-    const customer = customers.find(c => String(c?.id) === String(customerId));
-    if (!customer) return send(res, 404, { error: 'Customer not found' });
 
-    const customerLoans = loans.filter(l => String(l?.customerId) === String(customerId));
-    const loanIds = new Set(customerLoans.map(l => String(l?.id)));
-    const customerPayments = payments.filter(p => loanIds.has(String(p?.loanId)));
-    const customerSchedules = schedules.filter(s => loanIds.has(String(s?.loanId)));
-    const blacklist = blacklistRows.find(b => String(b?.customerId) === String(customerId)) || null;
-    const expired = expiredCustomers.find(c => String(c?.id || c?.customerId) === String(customerId)) || null;
+    // Phase 3.2: read customer details directly from normalized PostgreSQL.
+    // The original JSON object is preserved in data_json so the frontend
+    // contract remains compatible while the large user_data JSONB document
+    // is no longer loaded for this request.
+    const customerResult = await db.query(`
+      SELECT
+        c.data_json AS customer_json,
+        COALESCE(ls.loan_count, 0)::int AS loan_count,
+        COALESCE(ls.total_loan, 0)::numeric AS total_loan,
+        COALESCE(ps.payment_count, 0)::int AS payment_count,
+        COALESCE(ss.schedule_count, 0)::int AS schedule_count,
+        b.data_json AS blacklist_json,
+        e.data_json AS expired_json
+      FROM customers c
+      LEFT JOIN (
+        SELECT customer_id, COUNT(*)::int AS loan_count, COALESCE(SUM(amount),0)::numeric AS total_loan
+        FROM loans GROUP BY customer_id
+      ) ls ON ls.customer_id = c.id
+      LEFT JOIN (
+        SELECT l.customer_id, COUNT(p.*)::int AS payment_count
+        FROM loans l JOIN payments p ON p.loan_id = l.id
+        WHERE l.customer_id = $1
+        GROUP BY l.customer_id
+      ) ps ON ps.customer_id = c.id
+      LEFT JOIN (
+        SELECT l.customer_id, COUNT(s.*)::int AS schedule_count
+        FROM loans l JOIN schedules s ON s.loan_id = l.id
+        WHERE l.customer_id = $1
+        GROUP BY l.customer_id
+      ) ss ON ss.customer_id = c.id
+      LEFT JOIN LATERAL (
+        SELECT data_json FROM blacklist WHERE customer_id = c.id ORDER BY created_at DESC NULLS LAST LIMIT 1
+      ) b ON TRUE
+      LEFT JOIN LATERAL (
+        SELECT data_json FROM expired_customers WHERE customer_id = c.id ORDER BY expired_date DESC NULLS LAST LIMIT 1
+      ) e ON TRUE
+      WHERE c.id = $1
+      LIMIT 1
+    `, [customerId]);
+
+    if (!customerResult.rows.length) return send(res, 404, { error: 'Customer not found' });
+    const row = customerResult.rows[0];
+    const customer = typeof row.customer_json === 'string' ? JSON.parse(row.customer_json) : (row.customer_json || {});
+
+    const loansResult = await db.query(`
+      SELECT data_json
+      FROM loans
+      WHERE customer_id = $1
+      ORDER BY start_date DESC NULLS LAST, id DESC
+    `, [customerId]);
+    const loans = loansResult.rows.map(r => typeof r.data_json === 'string' ? JSON.parse(r.data_json) : r.data_json);
+    const loanIds = loans.map(l => String(l?.id || '')).filter(Boolean);
+
+    let payments = [], schedules = [];
+    if (loanIds.length) {
+      const [paymentResult, scheduleResult] = await Promise.all([
+        db.query(`SELECT data_json FROM payments WHERE loan_id = ANY($1::text[]) ORDER BY payment_date DESC NULLS LAST, id DESC`, [loanIds]),
+        db.query(`SELECT data_json FROM schedules WHERE loan_id = ANY($1::text[]) ORDER BY due_date DESC NULLS LAST, id DESC`, [loanIds])
+      ]);
+      payments = paymentResult.rows.map(r => typeof r.data_json === 'string' ? JSON.parse(r.data_json) : r.data_json);
+      schedules = scheduleResult.rows.map(r => typeof r.data_json === 'string' ? JSON.parse(r.data_json) : r.data_json);
+    }
+
+    const blacklist = row.blacklist_json ? (typeof row.blacklist_json === 'string' ? JSON.parse(row.blacklist_json) : row.blacklist_json) : null;
+    const expired = row.expired_json ? (typeof row.expired_json === 'string' ? JSON.parse(row.expired_json) : row.expired_json) : null;
 
     return send(res, 200, {
       customer,
-      loans: customerLoans,
-      payments: customerPayments,
-      schedules: customerSchedules,
+      loans,
+      payments,
+      schedules,
       blacklist,
       expired,
       summary: {
-        loanCount: customerLoans.length,
-        totalLoan: customerLoans.reduce((sum, l) => sum + Number(l?.amount || 0), 0),
-        paymentCount: customerPayments.length,
-        scheduleCount: customerSchedules.length
+        loanCount: Number(row.loan_count || 0),
+        totalLoan: Number(row.total_loan || 0),
+        paymentCount: Number(row.payment_count || 0),
+        scheduleCount: Number(row.schedule_count || 0)
       },
       user: u
     });
@@ -1993,96 +2043,121 @@ async function api(req, res) {
     const rawLimit = Number.parseInt(url.searchParams.get('limit') || '50', 10);
     const page = Number.isFinite(rawPage) ? Math.max(1, rawPage) : 1;
     const limit = Number.isFinite(rawLimit) ? Math.min(100, Math.max(1, rawLimit)) : 50;
-    const search = String(url.searchParams.get('search') || '').trim().toLowerCase().slice(0, 100);
+    const search = String(url.searchParams.get('search') || '').trim().slice(0, 100);
     const sort = String(url.searchParams.get('sort') || 'name');
-    const order = String(url.searchParams.get('order') || 'asc').toLowerCase() === 'desc' ? 'desc' : 'asc';
+    const order = String(url.searchParams.get('order') || 'asc').toLowerCase() === 'desc' ? 'DESC' : 'ASC';
 
-    const allowedSorts = new Set(['id', 'name', 'mobile', 'city', 'district', 'createdAt', 'loanCount', 'totalLoan', 'remaining', 'status']);
-    const sortKey = allowedSorts.has(sort) ? sort : 'name';
-    const d = await userData();
-    const customers = Array.isArray(d.customers) ? d.customers : [];
-    const loans = Array.isArray(d.loans) ? d.loans : [];
-    const payments = Array.isArray(d.payments) ? d.payments : [];
-    const expiredIds = new Set((d.expiredCustomers || []).map(x => String(x.customerId)));
-    const blacklistedIds = new Set((d.blacklist || []).map(x => String(x.customerId)));
-
-    // Build loan and principal summaries in one pass each, so each customer
-    // is not repeatedly scanning all loans/payments.
-    const loanCountByCustomer = new Map();
-    const totalLoanByCustomer = new Map();
-    const loanIdsByCustomer = new Map();
-    const loanCustomerById = new Map();
-    for (const loan of loans) {
-      const cid = String(loan.customerId || '');
-      const lid = String(loan.id || '');
-      if (!cid) continue;
-      loanCountByCustomer.set(cid, (loanCountByCustomer.get(cid) || 0) + 1);
-      totalLoanByCustomer.set(cid, (totalLoanByCustomer.get(cid) || 0) + Number(loan.amount || 0));
-      if (!loanIdsByCustomer.has(cid)) loanIdsByCustomer.set(cid, new Set());
-      if (lid) loanIdsByCustomer.get(cid).add(lid);
-      if (lid) loanCustomerById.set(lid, cid);
-    }
-
-    const paidPrincipalByLoan = new Map();
-    for (const payment of payments) {
-      const lid = String(payment.loanId || '');
-      if (!lid) continue;
-      paidPrincipalByLoan.set(lid, (paidPrincipalByLoan.get(lid) || 0) + Number(payment.principal || 0));
-    }
-
-    const remainingByCustomer = new Map();
-    for (const loan of loans) {
-      const cid = String(loan.customerId || '');
-      if (!cid) continue;
-      const remaining = Math.max(0, Number(loan.amount || 0) - (paidPrincipalByLoan.get(String(loan.id || '')) || 0));
-      remainingByCustomer.set(cid, (remainingByCustomer.get(cid) || 0) + remaining);
-    }
-
-    const customerRows = [];
-    for (const customer of customers) {
-      const cid = String(customer.id || '');
-      if (!cid || expiredIds.has(cid)) continue;
-
-      const name = [customer.firstName, customer.middleName, customer.lastName].filter(Boolean).join(' ') || String(customer.name || cid);
-      const city = String(customer.city || customer.village || '');
-      const mobile = String(customer.mobile || '');
-      const district = String(customer.district || '');
-      const reference = String(customer.reference || customer.customerReference || '');
-      const loanCount = loanCountByCustomer.get(cid) || 0;
-      const totalLoan = totalLoanByCustomer.get(cid) || 0;
-      const remaining = remainingByCustomer.get(cid) || 0;
-      const status = blacklistedIds.has(cid) ? 'BLACKLISTED' : (loanCount > 0 && remaining <= 0.005 ? 'COMPLETED' : 'ACTIVE');
-      const haystack = `${cid} ${name} ${mobile} ${city} ${district} ${reference} ${customer.address || ''} ${status}`.toLowerCase();
-
-      if (search && !haystack.includes(search)) continue;
-
-      customerRows.push({
-        ...customer,
-        city,
-        loanCount,
-        totalLoan,
-        remaining,
-        status
-      });
-    }
-
-    const compare = (a, b) => {
-      let av = a[sortKey];
-      let bv = b[sortKey];
-      if (sortKey === 'name') { av = [a.firstName, a.middleName, a.lastName].filter(Boolean).join(' ') || a.name || a.id; bv = [b.firstName, b.middleName, b.lastName].filter(Boolean).join(' ') || b.name || b.id; }
-      if (typeof av === 'number' && typeof bv === 'number') return av - bv;
-      return String(av ?? '').localeCompare(String(bv ?? ''), undefined, { numeric: true, sensitivity: 'base' });
+    // Phase 3.2: true SQL pagination/search. No full user_data JSONB read.
+    const sortMap = {
+      id: 'id',
+      name: `COALESCE(NULLIF(TRIM(CONCAT_WS(' ', first_name, middle_name, last_name)), ''), name, id)`,
+      mobile: 'mobile',
+      city: 'city',
+      district: 'district',
+      createdAt: 'created_at',
+      loanCount: 'loan_count',
+      totalLoan: 'total_loan',
+      remaining: 'remaining',
+      status: 'customer_status'
     };
-    customerRows.sort((a, b) => {
-      const result = compare(a, b);
-      return order === 'desc' ? -result : result;
-    });
+    const sortExpr = sortMap[sort] || sortMap.name;
+    const offset = (page - 1) * limit;
+    const searchParam = `%${search.replace(/[%_\\]/g, '\\$&')}%`;
 
-    const total = customerRows.length;
+    const result = await db.query(`
+      WITH loan_totals AS (
+        SELECT l.customer_id,
+               COUNT(*)::int AS loan_count,
+               COALESCE(SUM(l.amount),0)::numeric AS total_loan,
+               COALESCE(SUM(GREATEST(0, l.amount - COALESCE(p.paid_principal,0))),0)::numeric AS remaining
+        FROM loans l
+        LEFT JOIN (
+          SELECT loan_id, COALESCE(SUM(principal),0)::numeric AS paid_principal
+          FROM payments GROUP BY loan_id
+        ) p ON p.loan_id = l.id
+        GROUP BY l.customer_id
+      ), rows AS (
+        SELECT
+          c.data_json AS customer_json,
+          c.id, c.first_name, c.middle_name, c.last_name, c.name,
+          c.mobile, c.alternate_mobile, c.reference, c.address, c.city, c.district, c.pincode,
+          c.created_at,
+          COALESCE(lt.loan_count,0)::int AS loan_count,
+          COALESCE(lt.total_loan,0)::numeric AS total_loan,
+          COALESCE(lt.remaining,0)::numeric AS remaining,
+          CASE
+            WHEN EXISTS (SELECT 1 FROM blacklist b WHERE b.customer_id = c.id) THEN 'BLACKLISTED'
+            WHEN COALESCE(lt.loan_count,0) > 0 AND COALESCE(lt.remaining,0) <= 0.005 THEN 'COMPLETED'
+            ELSE 'ACTIVE'
+          END AS customer_status
+        FROM customers c
+        LEFT JOIN loan_totals lt ON lt.customer_id = c.id
+        WHERE NOT EXISTS (SELECT 1 FROM expired_customers e WHERE e.customer_id = c.id)
+          AND (
+            $1 = '' OR
+            c.id ILIKE $2 ESCAPE '\\' OR
+            COALESCE(c.first_name,'') ILIKE $2 ESCAPE '\\' OR
+            COALESCE(c.middle_name,'') ILIKE $2 ESCAPE '\\' OR
+            COALESCE(c.last_name,'') ILIKE $2 ESCAPE '\\' OR
+            COALESCE(c.name,'') ILIKE $2 ESCAPE '\\' OR
+            COALESCE(c.mobile,'') ILIKE $2 ESCAPE '\\' OR
+            COALESCE(c.city,'') ILIKE $2 ESCAPE '\\' OR
+            COALESCE(c.district,'') ILIKE $2 ESCAPE '\\' OR
+            COALESCE(c.reference,'') ILIKE $2 ESCAPE '\\' OR
+            COALESCE(c.address,'') ILIKE $2 ESCAPE '\\' OR
+            EXISTS (
+              SELECT 1 FROM loans sl
+              WHERE sl.customer_id = c.id
+                AND (sl.id ILIKE $2 ESCAPE '\\' OR COALESCE(sl.khata_no,'') ILIKE $2 ESCAPE '\\')
+            )
+          )
+      )
+      SELECT *, COUNT(*) OVER()::int AS total_count
+      FROM rows
+      ORDER BY ${sortExpr} ${order} NULLS LAST, c_id_sort ASC
+      LIMIT $3 OFFSET $4
+    `.replace('c_id_sort', 'id'), [search, searchParam, limit, offset]);
+
+    const total = result.rows.length ? Number(result.rows[0].total_count) : 0;
     const totalPages = Math.max(1, Math.ceil(total / limit));
     const safePage = Math.min(page, totalPages);
-    const start = (safePage - 1) * limit;
-    const data = customerRows.slice(start, start + limit);
+
+    // If a requested page is beyond the end, re-query its safe page.
+    let rows = result.rows;
+    if (page !== safePage) {
+      const retry = await db.query(`
+        WITH loan_totals AS (
+          SELECT l.customer_id, COUNT(*)::int AS loan_count,
+                 COALESCE(SUM(l.amount),0)::numeric AS total_loan,
+                 COALESCE(SUM(GREATEST(0, l.amount - COALESCE(p.paid_principal,0))),0)::numeric AS remaining
+          FROM loans l
+          LEFT JOIN (SELECT loan_id, COALESCE(SUM(principal),0)::numeric AS paid_principal FROM payments GROUP BY loan_id) p ON p.loan_id=l.id
+          GROUP BY l.customer_id
+        ), rows AS (
+          SELECT c.data_json AS customer_json, c.id, c.first_name, c.middle_name, c.last_name, c.name, c.mobile, c.alternate_mobile,
+                 c.reference, c.address, c.city, c.district, c.pincode, c.created_at,
+                 COALESCE(lt.loan_count,0)::int AS loan_count, COALESCE(lt.total_loan,0)::numeric AS total_loan, COALESCE(lt.remaining,0)::numeric AS remaining,
+                 CASE WHEN EXISTS(SELECT 1 FROM blacklist b WHERE b.customer_id=c.id) THEN 'BLACKLISTED'
+                      WHEN COALESCE(lt.loan_count,0)>0 AND COALESCE(lt.remaining,0)<=0.005 THEN 'COMPLETED' ELSE 'ACTIVE' END AS customer_status
+          FROM customers c LEFT JOIN loan_totals lt ON lt.customer_id=c.id
+          WHERE NOT EXISTS(SELECT 1 FROM expired_customers e WHERE e.customer_id=c.id)
+            AND ($1='' OR c.id ILIKE $2 ESCAPE '\\' OR COALESCE(c.first_name,'') ILIKE $2 ESCAPE '\\' OR COALESCE(c.last_name,'') ILIKE $2 ESCAPE '\\' OR COALESCE(c.mobile,'') ILIKE $2 ESCAPE '\\' OR COALESCE(c.city,'') ILIKE $2 ESCAPE '\\' OR COALESCE(c.district,'') ILIKE $2 ESCAPE '\\' OR COALESCE(c.reference,'') ILIKE $2 ESCAPE '\\' OR COALESCE(c.address,'') ILIKE $2 ESCAPE '\\' OR EXISTS(SELECT 1 FROM loans sl WHERE sl.customer_id=c.id AND (sl.id ILIKE $2 ESCAPE '\\' OR COALESCE(sl.khata_no,'') ILIKE $2 ESCAPE '\\')))
+        ) SELECT * FROM rows ORDER BY ${sortExpr} ${order} NULLS LAST, id ASC LIMIT $3 OFFSET $4
+      `, [search, searchParam, limit, (safePage - 1) * limit]);
+      rows = retry.rows;
+    }
+
+    const data = rows.map(r => {
+      const customer = typeof r.customer_json === 'string' ? JSON.parse(r.customer_json) : (r.customer_json || {});
+      return {
+        ...customer,
+        city: customer.city || r.city || '',
+        loanCount: Number(r.loan_count || 0),
+        totalLoan: Number(r.total_loan || 0),
+        remaining: Number(r.remaining || 0),
+        status: r.customer_status
+      };
+    });
 
     return send(res, 200, {
       customers: data,

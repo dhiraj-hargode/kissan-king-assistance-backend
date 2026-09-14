@@ -1852,7 +1852,7 @@ async function api(req, res) {
     return [
       p.id,
       p.date,
-      customerName(customer || {}),
+      dashboardCustomerName(customer || {}),
       p.loanId,
       p.principal,
       p.interest,
@@ -3041,7 +3041,7 @@ async function api(req, res) {
     const rows = (Array.isArray(data.payments) ? data.payments : []).map(p => {
       const loan = loans.get(String(p.loanId));
       const customer = loan ? customers.get(String(loan.customerId)) : null;
-      return [p.id,p.date,customerName(customer || {}),p.loanId,p.principal,p.interest,p.penalty,p.total,p.mode,p.notes];
+      return [p.id,p.date,dashboardCustomerName(customer || {}),p.loanId,p.principal,p.interest,p.penalty,p.total,p.mode,p.notes];
     });
     const csv = [header, ...rows].map(row => row.map(escCsv).join(',')).join('\n');
     res.writeHead(200, {

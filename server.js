@@ -36,6 +36,7 @@ const ROLES = ['Administrator'];
 const WRITE_ROLES = new Set(['Administrator']);
 const PAYMENT_ROLES = new Set(['Administrator']);
 const ADMIN_ROLES = new Set(['Administrator']);
+let excelImportInProgress = false;
 
 function now() {
   return new Date().toISOString();
@@ -1914,14 +1915,30 @@ async function api(req, res) {
   if (method === 'POST' && parts[1] === 'import-excel') {
     if (!ADMIN_ROLES.has(u.role)) return send(res, 403, { error: 'Administrator permission required' });
 
-    const b = await readBody(req);
+    let b;
     try {
-      const mode = b.mode === 'replace' ? 'replace' : 'add';
-      const result = await importExcelPayload(b.fileBase64, mode);
+      b = await readBody(req);
+    } catch (e) {
+      return send(res, 400, { error: e.message || 'Invalid import request' });
+    }
 
-      if (b.preview) {
+    const mode = b.mode === 'replace' ? 'replace' : 'add';
+    if (!b.preview && excelImportInProgress) {
+      return send(res, 409, { error: 'Another Excel import is already in progress. Please wait for it to finish before starting another import.' });
+    }
+
+    if (b.preview) {
+      try {
+        const result = await importExcelPayload(b.fileBase64, mode);
         return send(res, 200, { preview: true, issues: result.issues, stats: result.stats, sheets: result.sheets });
+      } catch (e) {
+        return send(res, 400, { error: e.message || 'Excel preview failed' });
       }
+    }
+
+    excelImportInProgress = true;
+    try {
+      const result = await importExcelPayload(b.fileBase64, mode);
 
       if (result.issues.length) {
         return send(res, 400, {
@@ -1935,7 +1952,10 @@ async function api(req, res) {
       await saveData(result.data);
       return send(res, 200, { ok: true, stats: result.stats });
     } catch (e) {
+      console.error('Excel import failed:', e.message);
       return send(res, 400, { error: e.message || 'Excel import failed' });
+    } finally {
+      excelImportInProgress = false;
     }
   }
 

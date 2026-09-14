@@ -1389,6 +1389,10 @@ function isoDateFromQuery(value) {
   const v = String(value || '').trim();
   return /^\d{4}-\d{2}-\d{2}$/.test(v) ? v : new Date().toISOString().slice(0, 10);
 }
+function optionalIsoDateFromQuery(value) {
+  const v = String(value || '').trim();
+  return /^\d{4}-\d{2}-\d{2}$/.test(v) ? v : null;
+}
 
 function dashboardCustomerName(c) {
   return [c?.firstName, c?.middleName, c?.lastName].filter(Boolean).join(' ') || String(c?.name || c?.id || '');
@@ -1848,8 +1852,8 @@ async function api(req, res) {
     const page = Number.isFinite(rawPage) ? Math.max(1, rawPage) : 1;
     const limit = Number.isFinite(rawLimit) ? Math.min(100, Math.max(1, rawLimit)) : 50;
     const search = String(url.searchParams.get('search') || '').trim().slice(0, 100);
-    const from = isoDateFromQuery(url.searchParams.get('from'));
-    const to = isoDateFromQuery(url.searchParams.get('to'));
+    const from = optionalIsoDateFromQuery(url.searchParams.get('from'));
+    const to = optionalIsoDateFromQuery(url.searchParams.get('to'));
     const mode = String(url.searchParams.get('mode') || '').trim().toLowerCase().slice(0, 50);
     const customerId = String(url.searchParams.get('customerId') || '').trim();
     const loanId = String(url.searchParams.get('loanId') || '').trim();

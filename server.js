@@ -2225,6 +2225,55 @@ async function api(req, res) {
     return res.end(csv);
   }
 
+  // Dedicated JSON backup restore endpoint. This replaces the shared JSONB document
+  // directly instead of routing the backup through the browser mutation-diff path.
+  // That avoids comparing/stringifying every record twice for large backups.
+  if (method === 'POST' && parts[1] === 'backup' && parts[2] === 'restore' && !parts[3]) {
+    if (!ADMIN_ROLES.has(u.role)) return send(res, 403, { error: 'Administrator permission required' });
+
+    let b;
+    try {
+      b = await readBody(req);
+    } catch (e) {
+      return send(res, 400, { error: e.message || 'Invalid backup request' });
+    }
+
+    const incoming = b?.sharedData && typeof b.sharedData === 'object' ? b.sharedData : b;
+    if (!incoming || !Array.isArray(incoming.customers) || !Array.isArray(incoming.loans) ||
+        !Array.isArray(incoming.schedules) || !Array.isArray(incoming.payments) ||
+        !Array.isArray(incoming.blacklist)) {
+      return send(res, 400, { error: 'Invalid or incompatible backup file' });
+    }
+
+    const normalized = normalizeData(incoming);
+    const errors = integrity(normalized);
+    if (errors.length) {
+      return send(res, 400, {
+        error: 'Backup validation failed',
+        details: errors.slice(0, 20)
+      });
+    }
+
+    try {
+      await saveData(normalized);
+      return send(res, 200, {
+        ok: true,
+        restored: {
+          customers: normalized.customers.length,
+          loans: normalized.loans.length,
+          schedules: normalized.schedules.length,
+          payments: normalized.payments.length,
+          blacklist: normalized.blacklist.length,
+          expiredCustomers: normalized.expiredCustomers.length
+        },
+        user: u
+      });
+    } catch (e) {
+      console.error('Backup restore failed:', e);
+      return send(res, 500, { error: e.message || 'Could not restore backup' });
+    }
+  }
+
   if (method === 'GET' && parts[1] === 'backup') {
     if (!ADMIN_ROLES.has(u.role)) return send(res, 403, { error: 'Administrator permission required' });
     return send(res, 200, { version: 2, createdAt: now(), sharedData: await userData() });

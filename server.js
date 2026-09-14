@@ -1813,6 +1813,69 @@ async function api(req, res) {
     });
   }
 
+  if (method === 'GET' && parts[1] === 'payments' && parts[2] === 'export') {
+  const u = await sessionUser(req);
+  if (!u) return send(res, 401, { error: 'Authentication required' });
+
+  const data = await userData();
+  const customers = new Map(
+    (Array.isArray(data.customers) ? data.customers : [])
+      .map(c => [String(c.id), c])
+  );
+  const loans = new Map(
+    (Array.isArray(data.loans) ? data.loans : [])
+      .map(l => [String(l.id), l])
+  );
+
+  const escCsv = value =>
+    `"${String(value ?? '').replaceAll('"', '""')}"`;
+
+  const header = [
+    'Payment ID',
+    'Date',
+    'Customer',
+    'Loan ID',
+    'Principal',
+    'Interest',
+    'Penalty',
+    'Total',
+    'Mode',
+    'Notes'
+  ];
+
+  const rows = (Array.isArray(data.payments) ? data.payments : []).map(p => {
+    const loan = loans.get(String(p.loanId));
+    const customer = loan
+      ? customers.get(String(loan.customerId))
+      : null;
+
+    return [
+      p.id,
+      p.date,
+      customerName(customer || {}),
+      p.loanId,
+      p.principal,
+      p.interest,
+      p.penalty,
+      p.total,
+      p.mode,
+      p.notes
+    ];
+  });
+
+  const csv = [header, ...rows]
+    .map(row => row.map(escCsv).join(','))
+    .join('\n');
+
+  res.writeHead(200, {
+    'Content-Type': 'text/csv; charset=utf-8',
+    'Content-Disposition': `attachment; filename="payments-${todayISO()}.csv"`,
+    'Cache-Control': 'no-store'
+  });
+
+  return res.end(csv);
+}
+
   // Paginated customer read API. This endpoint is directly backed by normalized PostgreSQL.
   // Payment history reads are backed directly by normalized PostgreSQL.
   if (method === 'GET' && parts[1] === 'payments' && parts[2]) {

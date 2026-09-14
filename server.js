@@ -1281,12 +1281,15 @@ async function importExcelPayload(base64, mode = 'add') {
     if (!validDate(loan.startDate) || !Number.isInteger(loan.duration) || loan.duration < 1) continue;
     let outstanding = Number(loan.amount) || 0;
     for (let i = 1; i <= loan.duration; i++) {
-      const principal = loan.emiOption === 'YES'
-        ? (i === loan.duration
+      const method = String(loan.method || 'Reducing Balance');
+      let principal = 0;
+      let interest = 0;
+      if (loan.emiOption === 'YES') {
+        principal = i === loan.duration
           ? Number(outstanding.toFixed(2))
-          : Number((Number(loan.amount) / loan.duration).toFixed(2)))
-        : 0;
-      const interest = Number((Math.max(0, outstanding) * Number(loan.interestRate || 0) / 100).toFixed(2));
+          : Number((Number(loan.amount) / loan.duration).toFixed(2));
+      }
+      interest = Number(((method === 'Flat Monthly' ? Number(loan.amount) : Math.max(0, outstanding)) * Number(loan.interestRate || 0) / 100).toFixed(2));
       const due = monthlyDateServer(loan.startDate, i - 1);
       const schedule = {
         id: `SCH-IMP-${loan.id}-${i}`,
@@ -1440,16 +1443,24 @@ function buildDashboardData(data, asOf, range = '6m') {
   for (const [loanId, ss] of grouped) {
     const loan = loanById.get(loanId);
     if (!loan) continue;
-    const scheduledAmount = ss.reduce((sum, s) => sum + Number(s.emi || 0) + Number(s.penalty || 0), 0);
     const due = ss.reduce((sum, s) => sum + effectiveDue(s), 0);
-    const relevantPayments = todaysPayments.filter(p => String(p.loanId) === loanId && (ss.some(x => String(x.id) === String(p.scheduleId || '')) || (!p.scheduleId && ss.some(x => String(x.dueDate) === String(p.date)))));
+    const relevantPayments = todaysPayments.filter(p => String(p.loanId) === loanId &&
+      (ss.some(x => String(x.id) === String(p.scheduleId || '')) ||
+       (!p.scheduleId && ss.some(x => String(x.dueDate) === String(p.date)))));
     const paidOnDate = relevantPayments.reduce((sum, p) => sum + Number(p.total || 0), 0);
     const fullyPaid = ss.every(s => effectiveDue(s) <= 0.005);
-    const remainingDue = fullyPaid ? 0 : Math.max(0, due - paidOnDate);
-    dueTodayRows.push({ loanId, loan, customer: customerById.get(String(loan.customerId)) || null, schedules: ss, due: remainingDue, grossDue: Math.max(scheduledAmount, due), paidOnDate, fullyPaid });
+    dueTodayRows.push({
+      loanId, loan,
+      customer: customerById.get(String(loan.customerId)) || null,
+      schedules: ss,
+      due: Number(due.toFixed(2)),
+      grossDue: Number(due.toFixed(2)),
+      paidOnDate,
+      fullyPaid
+    });
   }
 
-  const expected = dueTodayRows.reduce((a, r) => a + Number(r.grossDue || 0), 0);
+  const expected = dueTodayRows.reduce((a, r) => a + Number(r.due || 0), 0);
   const collected = todaysPayments.reduce((a, p) => a + Number(p.total || 0), 0);
   const principalToday = todaysPayments.reduce((a, p) => a + Number(p.principal || 0), 0);
   const interestToday = todaysPayments.reduce((a, p) => a + Number(p.interest || 0), 0);
@@ -1527,7 +1538,14 @@ function buildDashboardData(data, asOf, range = '6m') {
   if (range === '7d') {
     for (let i=6;i>=0;i--) { const d=new Date(now); d.setDate(d.getDate()-i); const key=dayKey(d); trend.push({ key, label:d.toLocaleString('en-IN',{day:'2-digit',month:'short'}), total:sumPayments(new Date(key+'T00:00:00'),new Date(key+'T23:59:59')) }); }
   } else if (range === '30d') {
-    for (let i=5;i>=0;i--) { const end=new Date(now); end.setDate(end.getDate()-i*5); const key=dayKey(end); const from=new Date(key+'T00:00:00'); const to=new Date(from); to.setDate(to.getDate()+4); trend.push({ key, label:end.toLocaleString('en-IN',{day:'2-digit',month:'short'}), total:sumPayments(from,to) }); }
+    // Six five-day buckets ending on the selected as-of date. Never include
+    // future dates in the final bucket.
+    for (let i=5;i>=0;i--) {
+      const end=new Date(now); end.setDate(end.getDate()-i*5);
+      const from=new Date(end); from.setDate(from.getDate()-4);
+      const fromKey=dayKey(from), endKey=dayKey(end);
+      trend.push({ key:endKey, label:end.toLocaleString('en-IN',{day:'2-digit',month:'short'}), total:sumPayments(new Date(fromKey+'T00:00:00'),new Date(endKey+'T23:59:59')) });
+    }
   } else {
     const count = range === '1y' ? 12 : 6;
     for (let i=count-1;i>=0;i--) { const d=new Date(now.getFullYear(),now.getMonth()-i,1); const key=monthKey(d); const from=new Date(d.getFullYear(),d.getMonth(),1); const to=new Date(d.getFullYear(),d.getMonth()+1,0,23,59,59); trend.push({ key, label:d.toLocaleString('en-IN',{month:'short'}), total:sumPayments(from,to) }); }
@@ -1813,7 +1831,7 @@ async function api(req, res) {
     const url = new URL(req.url, 'http://localhost');
     const selected = isoDateFromQuery(url.searchParams.get('date'));
     const search = String(url.searchParams.get('search') || '').trim().toLowerCase().slice(0, 100);
-    const d = await userData(u.userId);
+    const d = await userData();
     const customers = Array.isArray(d.customers) ? d.customers : [];
     const loans = Array.isArray(d.loans) ? d.loans : [];
     const schedules = Array.isArray(d.schedules) ? d.schedules : [];
@@ -1839,50 +1857,57 @@ async function api(req, res) {
       return Number((installment + unpaidPenalty).toFixed(2));
     };
     const byLoan = new Map();
+    // Today's Collection is a reference ledger for the selected calendar date.
+    // Keep due, paid and manually-pending installments visible; Pending Payments
+    // is a separate work queue, not a filter that removes rows from this page.
     for (const s of schedules) {
-      if (String(s?.dueDate || '') !== selected || s?.manualPending) continue;
+      if (String(s?.dueDate || '') !== selected) continue;
       const l = loanById.get(String(s?.loanId || ''));
       if (!l || expired.has(String(l.customerId))) continue;
       const due = scheduleDue(s);
-      const sid = String(s.id);
-      const t = scheduleTotals.get(sid) || { principalInterest: 0, penalty: 0 };
-      const status = due <= 0.005 ? 'PAID' : String(s.dueDate) < selected ? 'OVERDUE' : String(s.dueDate) === selected ? 'DUE TODAY' : 'UPCOMING';
-      const row = byLoan.get(String(l.id)) || { loan: l, customer: loanCustomer(l), schedules: [], due: 0, grossDue: 0, paidOnDate: 0, fullyPaidInstallment: true, hasPaidSchedule: false };
+      const row = byLoan.get(String(l.id)) || {
+        loan: l, customer: loanCustomer(l), schedules: [], due: 0, grossDue: 0,
+        paidOnDate: 0, fullyPaidInstallment: true
+      };
       row.schedules.push(s);
       row.due += due;
-      row.grossDue += Number(s?.emi || 0) + Number(s?.penalty || 0);
+      // Expected means the amount still unpaid on the selected date, not the
+      // original scheduled EMI. A fully paid installment therefore contributes 0.
+      row.grossDue += due;
       row.fullyPaidInstallment = row.fullyPaidInstallment && due <= 0.005;
-      row.hasPaidSchedule = row.hasPaidSchedule || status === 'PAID';
       byLoan.set(String(l.id), row);
     }
+
     const paymentBySchedule = new Map();
-    const paymentByLoan = new Map();
     const principalByLoan = new Map();
     for (const p of payments) {
       const plid = String(p?.loanId || '');
       principalByLoan.set(plid, (principalByLoan.get(plid) || 0) + Number(p?.principal || 0));
       if (String(p?.date || '') !== selected) continue;
-      const lid = String(p?.loanId || '');
       const sid = String(p?.scheduleId || '').trim();
       if (sid) paymentBySchedule.set(sid, (paymentBySchedule.get(sid) || 0) + Number(p?.total || 0));
-      paymentByLoan.set(lid, (paymentByLoan.get(lid) || 0) + Number(p?.total || 0));
     }
+
     const rows = [];
     for (const row of byLoan.values()) {
       const l = row.loan, c = row.customer;
       row.loan = { ...l, paidPrincipal: principalByLoan.get(String(l.id)) || 0 };
       row.paidOnDate = row.schedules.reduce((sum, s) => sum + (paymentBySchedule.get(String(s.id)) || 0), 0);
-      const fullyPaidToday = row.fullyPaidInstallment || (row.paidOnDate > 0 && row.grossDue > 0 && row.paidOnDate >= row.grossDue - 0.005);
-      // Keep installments visible in Today's Collection even after they are
-      // moved to Pending Payments. The row is a historical/reference entry;
-      // its remark/action indicates that it is already pending.
-      const haystack = [l?.legacyKhataNo, l?.khataNo, l?.id, c?.id, c?.mobile, c?.reference, c?.firstName, c?.middleName, c?.lastName, c?.city, c?.district].filter(Boolean).join(' ').toLowerCase();
+      const fullyPaidToday = row.fullyPaidInstallment;
+      const haystack = [l?.legacyKhataNo, l?.khataNo, l?.id, c?.id, c?.mobile, c?.reference,
+        c?.firstName, c?.middleName, c?.lastName, c?.city, c?.district].filter(Boolean).join(' ').toLowerCase();
       if (search && !haystack.includes(search)) continue;
       const unpaid = row.schedules.find(s => scheduleDue(s) > 0.005) || row.schedules[0];
-      rows.push({ ...row, s: unpaid, due: row.fullyPaidInstallment ? 0 : Number(Math.max(0, row.due - row.paidOnDate).toFixed(2)), fullyPaidToday });
+      rows.push({
+        ...row,
+        s: unpaid,
+        due: Number(Math.max(0, row.due).toFixed(2)),
+        fullyPaidToday
+      });
     }
     rows.sort((a,b) => String(a.loan?.id || '').localeCompare(String(b.loan?.id || '')));
-    const allocated = payments.filter(p => String(p?.date || '') === selected && (!p.scheduleId || rows.some(r => r.schedules.some(s => String(s.id) === String(p.scheduleId)))));
+    const selectedScheduleIds = new Set(rows.flatMap(r => r.schedules.map(s => String(s.id))));
+    const allocated = payments.filter(p => String(p?.date || "") === selected && (!p.scheduleId || selectedScheduleIds.has(String(p.scheduleId))));
     return send(res, 200, {
       date: selected,
       rows,
@@ -1907,7 +1932,7 @@ async function api(req, res) {
     const limit = Number.isFinite(rawLimit) ? Math.min(100, Math.max(1, rawLimit)) : 50;
     const search = String(url.searchParams.get('search') || '').trim().toLowerCase().slice(0, 100);
     const asOf = isoDateFromQuery(url.searchParams.get('date'));
-    const d = await userData(u.userId);
+    const d = await userData();
     const customers = Array.isArray(d.customers) ? d.customers : [];
     const loans = Array.isArray(d.loans) ? d.loans : [];
     const schedules = Array.isArray(d.schedules) ? d.schedules : [];
@@ -2052,7 +2077,7 @@ async function api(req, res) {
     const u = await sessionUser(req);
     if (!u) return send(res, 401, { error: 'Authentication required' });
     const loanId = decodeURIComponent(parts[2]);
-    const d = await userData(u.userId);
+    const d = await userData();
     const customers = Array.isArray(d.customers) ? d.customers : [];
     const loans = Array.isArray(d.loans) ? d.loans : [];
     const payments = Array.isArray(d.payments) ? d.payments : [];
@@ -2066,10 +2091,17 @@ async function api(req, res) {
     const totalPaid = loanPayments.reduce((sum, p) => sum + Number(p?.total || 0), 0);
     const outstanding = Math.max(0, Number(loan.amount || 0) - paidPrincipal);
     const today = isoDateFromQuery(new URL(req.url, 'http://localhost').searchParams.get('date'));
+    const paidBySchedule = new Map();
+    for (const p of loanPayments) {
+      const sid=String(p?.scheduleId||'').trim();
+      if(!sid) continue;
+      paidBySchedule.set(sid,(paidBySchedule.get(sid)||0)+Number(p?.principal||0)+Number(p?.interest||0));
+    }
+    const scheduleDue = s => Math.max(0, Number(s?.emi||0)-Math.max(Number(s?.paid||0),paidBySchedule.get(String(s?.id))||0)) + Math.max(0, Number(s?.penalty||0)-loanPayments.filter(p=>String(p?.scheduleId||'')===String(s?.id)).reduce((a,p)=>a+Number(p?.penalty||0),0));
     const next = loanSchedules
-      .filter(s => Number(s?.emi || 0) - Number(s?.paid || 0) > 0.005 && String(s?.dueDate || '') >= today)
+      .filter(s => scheduleDue(s) > 0.005 && String(s?.dueDate || '') >= today)
       .sort((a, b) => String(a?.dueDate || '').localeCompare(String(b?.dueDate || '')))[0] || null;
-    const overdue = loanSchedules.some(s => String(s?.dueDate || '') < today && String(s?.status || '').toUpperCase() !== 'PAID' && (Number(s?.emi || 0) - Number(s?.paid || 0) > 0.005));
+    const overdue = loanSchedules.some(s => String(s?.dueDate || '') < today && scheduleDue(s) > 0.005);
     const status = outstanding <= 0.005 ? 'CLOSED' : String(loan.status || '').toUpperCase() === 'DEAD' ? 'DEAD' : overdue ? 'OVERDUE' : 'ACTIVE';
     return send(res, 200, {
       loan,
@@ -2093,7 +2125,7 @@ async function api(req, res) {
     const statusFilter = String(url.searchParams.get('status') || '').trim().toUpperCase();
     const sort = String(url.searchParams.get('sort') || 'startDate');
     const order = String(url.searchParams.get('order') || 'desc').toLowerCase() === 'asc' ? 'asc' : 'desc';
-    const d = await userData(u.userId);
+    const d = await userData();
     const customers = Array.isArray(d.customers) ? d.customers : [];
     const loans = Array.isArray(d.loans) ? d.loans : [];
     const payments = Array.isArray(d.payments) ? d.payments : [];
@@ -2168,9 +2200,9 @@ async function api(req, res) {
     const limit=Math.min(100,Math.max(1,Number.parseInt(url.searchParams.get('limit')||'50',10)||50));
     const search=String(url.searchParams.get('search')||'').trim().toLowerCase().slice(0,100);
     const date=isoDateFromQuery(url.searchParams.get('date'));
-    const d=await userData(u.userId),customers=Array.isArray(d.customers)?d.customers:[],loans=Array.isArray(d.loans)?d.loans:[],schedules=Array.isArray(d.schedules)?d.schedules:[],payments=Array.isArray(d.payments)?d.payments:[];
+    const d=await userData(),customers=Array.isArray(d.customers)?d.customers:[],loans=Array.isArray(d.loans)?d.loans:[],schedules=Array.isArray(d.schedules)?d.schedules:[],payments=Array.isArray(d.payments)?d.payments:[];
     const expiredIds=new Set((d.expiredCustomers||[]).map(x=>String(x.customerId||x.id||''))),byId=new Map(customers.map(c=>[String(c.id),c])),loanById=new Map(loans.map(l=>[String(l.id),l])),paidBySchedule=new Map(),paidByLoan=new Map();
-    for(const pay of payments){const sid=String(pay.scheduleId||'');const lid=String(pay.loanId||'');const total=Number(pay.total||0);if(sid)paidBySchedule.set(sid,(paidBySchedule.get(sid)||0)+total);if(lid)paidByLoan.set(lid,(paidByLoan.get(lid)||0)+Number(pay.principal||0));}
+    for(const pay of payments){const sid=String(pay.scheduleId||'');const lid=String(pay.loanId||'');const principalInterest=Number(pay.principal||0)+Number(pay.interest||0);if(sid)paidBySchedule.set(sid,(paidBySchedule.get(sid)||0)+principalInterest);if(lid)paidByLoan.set(lid,(paidByLoan.get(lid)||0)+Number(pay.principal||0));}
     const rows=[];
     for(const sch of schedules){const loan=loanById.get(String(sch.loanId));if(!loan||expiredIds.has(String(loan.customerId)))continue;const customer=byId.get(String(loan.customerId))||{};const scheduled=Math.max(0,Number(sch.emi||0));const paid=Math.max(Number(sch.paid||0),paidBySchedule.get(String(sch.id))||0);const pending=Math.max(0,scheduled-paid);if(!String(sch.dueDate||'')||String(sch.dueDate)>=date||pending<=0.005)continue;const hay=[loan.id,loan.khataNo,loan.legacyKhataNo,loan.customerId,customer.id,customer.firstName,customer.middleName,customer.lastName,customer.name,customer.mobile].join(' ').toLowerCase();if(search&&!hay.includes(search))continue;rows.push({schedule:sch,loan,customer,pending,daysLate:Math.max(0,Math.floor((new Date(date+'T00:00:00')-new Date(String(sch.dueDate)+'T00:00:00'))/86400000)),status:'OVERDUE'});}
     rows.sort((a,b)=>String(a.schedule.dueDate).localeCompare(String(b.schedule.dueDate)));
@@ -2186,7 +2218,7 @@ async function api(req, res) {
     const page = Math.max(1, Number.parseInt(url.searchParams.get('page') || '1', 10) || 1);
     const limit = Math.min(100, Math.max(1, Number.parseInt(url.searchParams.get('limit') || '50', 10) || 50));
     const search = String(url.searchParams.get('search') || '').trim().toLowerCase().slice(0, 100);
-    const d = await userData(u.userId);
+    const d = await userData();
     const customers = Array.isArray(d.customers) ? d.customers : [];
     const loans = Array.isArray(d.loans) ? d.loans : [];
     const blacklist = Array.isArray(d.blacklist) ? d.blacklist : [];
@@ -2218,7 +2250,7 @@ async function api(req, res) {
     const page = Math.max(1, Number.parseInt(url.searchParams.get('page') || '1', 10) || 1);
     const limit = Math.min(100, Math.max(1, Number.parseInt(url.searchParams.get('limit') || '50', 10) || 50));
     const search = String(url.searchParams.get('search') || '').trim().toLowerCase().slice(0, 100);
-    const d = await userData(u.userId);
+    const d = await userData();
     const customers = Array.isArray(d.customers) ? d.customers : [];
     const loans = Array.isArray(d.loans) ? d.loans : [];
     const expired = Array.isArray(d.expiredCustomers) ? d.expiredCustomers : [];
@@ -2244,7 +2276,7 @@ async function api(req, res) {
     const url=new URL(req.url,'http://localhost');
     const q=String(url.searchParams.get('q')||'').trim().toLowerCase().slice(0,100);
     if(!q) return send(res,200,{loans:[],user:u});
-    const d=await userData(u.userId), customers=Array.isArray(d.customers)?d.customers:[], loans=Array.isArray(d.loans)?d.loans:[];
+    const d=await userData(), customers=Array.isArray(d.customers)?d.customers:[], loans=Array.isArray(d.loans)?d.loans:[];
     const expiredIds=new Set((d.expiredCustomers||[]).map(x=>String(x.customerId||x.id||'')));
     const byId=new Map(customers.map(c=>[String(c.id),c]));
     const rows=loans.filter(l=>!expiredIds.has(String(l.customerId))).map(l=>{const c=byId.get(String(l.customerId))||{};const name=[c.firstName,c.middleName,c.lastName].filter(Boolean).join(' ')||c.name||'';return {loan:l,customer:c,name};}).filter(r=>[r.loan.id,r.loan.customerId,r.loan.khataNo,r.loan.legacyKhataNo,r.name,r.customer.mobile].join(' ').toLowerCase().includes(q)).slice(0,20);
@@ -2257,7 +2289,7 @@ async function api(req, res) {
     const u=await sessionUser(req); if(!u)return send(res,401,{error:'Authentication required'});
     const url=new URL(req.url,'http://localhost');
     const requested=Number.parseInt(url.searchParams.get('year')||'',10);
-    const d=await userData(u.userId);
+    const d=await userData();
     const customers=Array.isArray(d.customers)?d.customers:[], loans=Array.isArray(d.loans)?d.loans:[], payments=Array.isArray(d.payments)?d.payments:[];
     const validPayments=payments.filter(p=>/^\d{4}-\d{2}-\d{2}$/.test(String(p.date||'')) && loans.some(l=>String(l.id)===String(p.loanId)));
     const years=new Set();
@@ -2285,7 +2317,7 @@ async function api(req, res) {
     const u=await sessionUser(req); if(!u)return send(res,401,{error:'Authentication required'});
     const url=new URL(req.url,'http://localhost'); const q=String(url.searchParams.get('q')||'').trim().toLowerCase().slice(0,100);
     if(!q)return send(res,200,{customers:[],loans:[],user:u});
-    const d=await userData(u.userId),customers=Array.isArray(d.customers)?d.customers:[],loans=Array.isArray(d.loans)?d.loans:[];
+    const d=await userData(),customers=Array.isArray(d.customers)?d.customers:[],loans=Array.isArray(d.loans)?d.loans:[];
     const byId=new Map(customers.map(c=>[String(c.id),c]));
     const active=customers.filter(c=>!(d.expiredCustomers||[]).some(x=>String(x.customerId||x.id)===String(c.id)));
     const cs=active.filter(c=>[c.id,c.firstName,c.middleName,c.lastName,c.name,c.mobile,c.city].join(' ').toLowerCase().includes(q)).slice(0,8);
@@ -2812,26 +2844,6 @@ async function api(req, res) {
     });
   }
 
-  if (method === 'GET' && parts[1] === 'payments' && parts[2] === 'export') {
-    const data = await userData();
-    const customers = new Map((Array.isArray(data.customers) ? data.customers : []).map(c => [String(c.id), c]));
-    const loans = new Map((Array.isArray(data.loans) ? data.loans : []).map(l => [String(l.id), l]));
-    const escCsv = value => `"${String(value ?? '').replaceAll('"', '""')}"`;
-    const header = ['Payment ID','Date','Customer','Loan ID','Principal','Interest','Penalty','Total','Mode','Notes'];
-    const rows = (Array.isArray(data.payments) ? data.payments : []).map(p => {
-      const loan = loans.get(String(p.loanId));
-      const customer = loan ? customers.get(String(loan.customerId)) : null;
-      return [p.id,p.date,dashboardCustomerName(customer || {}),p.loanId,p.principal,p.interest,p.penalty,p.total,p.mode,p.notes];
-    });
-    const csv = [header, ...rows].map(row => row.map(escCsv).join(',')).join('\n');
-    res.writeHead(200, {
-      'Content-Type': 'text/csv; charset=utf-8',
-      'Content-Disposition': `attachment; filename="payments-${new Date().toISOString().slice(0, 10)}.csv"`,
-      'Cache-Control': 'no-store'
-    });
-    return res.end(csv);
-  }
-
   // Dedicated JSON backup restore endpoint. The payload is converted into normalized PostgreSQL tables.
   // That avoids comparing/stringifying every record twice for large backups.
   if (method === 'POST' && parts[1] === 'backup' && parts[2] === 'restore' && !parts[3]) {
@@ -2996,15 +3008,7 @@ async function start() {
   }
 }
 
-// Automatic backup check: once per minute, around 02:00 server local time.
-/*
-setInterval(() => {
-  const d = new Date();
-  if (d.getHours() === 2 && d.getMinutes() < 5) {
-    createBackup().catch(err => console.error('Scheduled backup error:', err.message));
-  }
-}, 60000);
-*/
+// Automatic daily backups are disabled. Manual backup and Excel-replace backups remain available.
 
 process.on('SIGTERM', async () => {
   console.log('SIGTERM received. Closing server...');

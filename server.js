@@ -1153,10 +1153,16 @@ async function api(req, res) {
   }
 
   if (method === 'GET' && parts[1] === 'dashboard') {
+    const u = await sessionUser(req);
+    if (!u) return send(res, 401, { error: 'Authentication required' });
     const d = await userData();
-    const asOf = isoDateFromQuery(new URL(req.url, 'http://localhost').searchParams.get('date'));
-    const range = String(new URL(req.url, 'http://localhost').searchParams.get('range') || '6m');
-    return send(res, 200, { dashboard: buildDashboardData(d, asOf, ['7d','30d','6m','1y'].includes(range) ? range : '6m'), user: u });
+    const url = new URL(req.url, 'http://localhost');
+    const asOf = isoDateFromQuery(url.searchParams.get('date'));
+    const range = String(url.searchParams.get('range') || '6m');
+    return send(res, 200, {
+      dashboard: buildDashboardData(d, asOf, ['7d','30d','6m','1y'].includes(range) ? range : '6m'),
+      user: u
+    });
   }
 
   if (parts[1] === 'auth') {

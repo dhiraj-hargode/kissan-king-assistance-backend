@@ -663,6 +663,7 @@ async function importExcelPayload(base64, mode = 'add') {
   const loansByKhata = new Map(target.loans.map(l => [String(l.khataNo || l.legacyKhataNo || '').toLowerCase(), l]));
   const paymentsById = new Map(target.payments.map(p => [String(p.id), p]));
   const newLoans = [];
+  const importedPayments = [];
 
   const addCustomer = (r, rowNo) => {
     let id = excelText(pick(r, ['Customer Id', 'Customer ID', 'CustomerId']));
@@ -835,6 +836,7 @@ async function importExcelPayload(base64, mode = 'add') {
 
     target.payments.push(p);
     paymentsById.set(id, p);
+    importedPayments.push(p);
     stats.payments++;
   });
 
@@ -868,11 +870,12 @@ async function importExcelPayload(base64, mode = 'add') {
     }
   });
 
-  // Generate schedules for new loans and attach imported payments to matching due dates.
+  // Generate schedules for new loans and attach ONLY newly imported payments.
+  // Use a loan/date index instead of scanning every schedule for every payment.
+  const schedulesByLoan = new Map();
   for (const loan of newLoans) {
     if (!validDate(loan.startDate) || !Number.isInteger(loan.duration) || loan.duration < 1) continue;
     let outstanding = Number(loan.amount) || 0;
-
     for (let i = 1; i <= loan.duration; i++) {
       const principal = loan.emiOption === 'YES'
         ? (i === loan.duration
@@ -881,7 +884,7 @@ async function importExcelPayload(base64, mode = 'add') {
         : 0;
       const interest = Number((Math.max(0, outstanding) * Number(loan.interestRate || 0) / 100).toFixed(2));
       const due = monthlyDateServer(loan.startDate, i - 1);
-      target.schedules.push({
+      const schedule = {
         id: `SCH-IMP-${loan.id}-${i}`,
         loanId: loan.id,
         customerId: loan.customerId,
@@ -893,21 +896,25 @@ async function importExcelPayload(base64, mode = 'add') {
         paid: 0,
         penalty: 0,
         status: 'UPCOMING'
-      });
+      };
+      target.schedules.push(schedule);
+      if (!schedulesByLoan.has(String(loan.id))) schedulesByLoan.set(String(loan.id), []);
+      schedulesByLoan.get(String(loan.id)).push(schedule);
       outstanding = Math.max(0, outstanding - principal);
       stats.schedules++;
     }
   }
 
-  for (const p of target.payments) {
+  for (const p of importedPayments) {
     if (p.scheduleId) continue;
-    const candidates = target.schedules.filter(s => String(s.loanId) === String(p.loanId));
+    const candidates = schedulesByLoan.get(String(p.loanId)) || [];
     let best = candidates.find(s => s.dueDate === p.date);
-    if (!best) {
-      const ts = candidates
-        .map(s => ({ s, d: Math.abs(new Date(s.dueDate) - new Date(p.date)) }))
-        .sort((a, b) => a.d - b.d)[0];
-      best = ts?.s;
+    if (!best && candidates.length) {
+      let bestDiff = Infinity;
+      for (const s of candidates) {
+        const d = Math.abs(Date.parse(s.dueDate + 'T00:00:00') - Date.parse(String(p.date) + 'T00:00:00'));
+        if (Number.isFinite(d) && d < bestDiff) { bestDiff = d; best = s; }
+      }
     }
     if (best) {
       p.scheduleId = best.id;
@@ -1911,6 +1918,56 @@ async function api(req, res) {
 
   const u = await sessionUser(req);
   if (!u) return send(res, 401, { error: 'Authentication required' });
+
+  // Administrator-only business data reset. Keeps administrator accounts and application settings.
+  if (method === 'POST' && parts[1] === 'admin' && parts[2] === 'clear-data' && !parts[3]) {
+    if (!ADMIN_ROLES.has(u.role)) return send(res, 403, { error: 'Administrator permission required' });
+
+    const client = await db.connect();
+    try {
+      await client.query('BEGIN');
+      const result = await client.query(
+        'SELECT data_json FROM user_data WHERE user_id = $1 FOR UPDATE',
+        [SHARED_DATA_ID]
+      );
+      const before = result.rows[0]
+        ? normalizeData(typeof result.rows[0].data_json === 'string' ? JSON.parse(result.rows[0].data_json) : result.rows[0].data_json)
+        : blankData();
+
+      const counts = {
+        customers: before.customers.length,
+        loans: before.loans.length,
+        schedules: before.schedules.length,
+        payments: before.payments.length,
+        blacklist: before.blacklist.length,
+        notifications: before.notifications.length,
+        deletedRecords: before.deletedRecords.length,
+        expiredCustomers: before.expiredCustomers.length,
+        pendingQueue: before.pendingQueue.length
+      };
+
+      const cleared = blankData();
+      // Preserve application configuration/logo while clearing business records.
+      cleared.settings = { ...before.settings };
+
+      await client.query(
+        `INSERT INTO user_data(user_id, data_json, updated_at)
+         VALUES ($1, $2::jsonb, $3)
+         ON CONFLICT (user_id) DO UPDATE
+         SET data_json = EXCLUDED.data_json, updated_at = EXCLUDED.updated_at`,
+        [SHARED_DATA_ID, JSON.stringify(cleared), now()]
+      );
+
+      await client.query('COMMIT');
+      return send(res, 200, { ok: true, cleared: counts, preserved: ['settings', 'administrator accounts'] });
+    } catch (e) {
+      try { await client.query('ROLLBACK'); } catch {}
+      console.error('Clear data failed:', e);
+      return send(res, 500, { error: e.message || 'Could not clear application data' });
+    } finally {
+      client.release();
+    }
+  }
 
   if (method === 'POST' && parts[1] === 'import-excel') {
     if (!ADMIN_ROLES.has(u.role)) return send(res, 403, { error: 'Administrator permission required' });

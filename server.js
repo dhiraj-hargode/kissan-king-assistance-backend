@@ -1873,8 +1873,9 @@ async function api(req, res) {
       row.loan = { ...l, paidPrincipal: principalByLoan.get(String(l.id)) || 0 };
       row.paidOnDate = row.schedules.reduce((sum, s) => sum + (paymentBySchedule.get(String(s.id)) || 0), 0);
       const fullyPaidToday = row.fullyPaidInstallment || (row.paidOnDate > 0 && row.grossDue > 0 && row.paidOnDate >= row.grossDue - 0.005);
-      const visible = !row.schedules.some(s => pendingIds.has(String(s.id))) || row.fullyPaidInstallment;
-      if (!visible) continue;
+      // Keep installments visible in Today's Collection even after they are
+      // moved to Pending Payments. The row is a historical/reference entry;
+      // its remark/action indicates that it is already pending.
       const haystack = [l?.legacyKhataNo, l?.khataNo, l?.id, c?.id, c?.mobile, c?.reference, c?.firstName, c?.middleName, c?.lastName, c?.city, c?.district].filter(Boolean).join(' ').toLowerCase();
       if (search && !haystack.includes(search)) continue;
       const unpaid = row.schedules.find(s => scheduleDue(s) > 0.005) || row.schedules[0];
@@ -2996,12 +2997,14 @@ async function start() {
 }
 
 // Automatic backup check: once per minute, around 02:00 server local time.
+/*
 setInterval(() => {
   const d = new Date();
   if (d.getHours() === 2 && d.getMinutes() < 5) {
     createBackup().catch(err => console.error('Scheduled backup error:', err.message));
   }
 }, 60000);
+*/
 
 process.on('SIGTERM', async () => {
   console.log('SIGTERM received. Closing server...');

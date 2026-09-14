@@ -1168,6 +1168,93 @@ async function api(req, res) {
   // Paginated customer read API. This is the first step toward removing
   // large client-side customer scans. The current JSONB storage model is
   // intentionally preserved for Phase 1/2; only the response is paginated.
+  // Paginated payment history API. The current JSONB storage model is preserved;
+  // only the requested payment rows are returned to the browser. Phase 3 can
+  // move this contract to a normalized PostgreSQL payments table.
+  if (method === 'GET' && parts[1] === 'payments' && parts[2]) {
+    const u = await sessionUser(req);
+    if (!u) return send(res, 401, { error: 'Authentication required' });
+    const paymentId = decodeURIComponent(parts[2]);
+    const d = await userData(u.userId);
+    const payments = Array.isArray(d.payments) ? d.payments : [];
+    const loans = Array.isArray(d.loans) ? d.loans : [];
+    const customers = Array.isArray(d.customers) ? d.customers : [];
+    const schedules = Array.isArray(d.schedules) ? d.schedules : [];
+    const payment = payments.find(p => String(p?.id) === String(paymentId));
+    if (!payment) return send(res, 404, { error: 'Payment not found' });
+    const loan = loans.find(l => String(l?.id) === String(payment.loanId)) || null;
+    const customer = loan ? customers.find(c => String(c?.id) === String(loan.customerId)) || null : null;
+    const schedule = payment.scheduleId
+      ? schedules.find(s => String(s?.id) === String(payment.scheduleId)) || null
+      : null;
+    return send(res, 200, { payment, loan, customer, schedule, user: u });
+  }
+
+  if (method === 'GET' && parts[1] === 'payments' && !parts[2]) {
+    const u = await sessionUser(req);
+    if (!u) return send(res, 401, { error: 'Authentication required' });
+    const url = new URL(req.url, 'http://localhost');
+    const rawPage = Number.parseInt(url.searchParams.get('page') || '1', 10);
+    const rawLimit = Number.parseInt(url.searchParams.get('limit') || '50', 10);
+    const page = Number.isFinite(rawPage) ? Math.max(1, rawPage) : 1;
+    const limit = Number.isFinite(rawLimit) ? Math.min(100, Math.max(1, rawLimit)) : 50;
+    const search = String(url.searchParams.get('search') || '').trim().toLowerCase().slice(0, 100);
+    const from = isoDateFromQuery(url.searchParams.get('from'));
+    const to = isoDateFromQuery(url.searchParams.get('to'));
+    const mode = String(url.searchParams.get('mode') || '').trim().toLowerCase().slice(0, 50);
+    const customerId = String(url.searchParams.get('customerId') || '').trim();
+    const loanId = String(url.searchParams.get('loanId') || '').trim();
+    const d = await userData(u.userId);
+    const payments = Array.isArray(d.payments) ? d.payments : [];
+    const loans = Array.isArray(d.loans) ? d.loans : [];
+    const customers = Array.isArray(d.customers) ? d.customers : [];
+    const loanById = new Map(loans.map(l => [String(l.id), l]));
+    const customerById = new Map(customers.map(c => [String(c.id), c]));
+    const rows = [];
+    for (const payment of payments) {
+      const lid = String(payment?.loanId || '');
+      const loan = loanById.get(lid) || null;
+      const customer = loan ? customerById.get(String(loan.customerId)) || null : null;
+      const cid = String(loan?.customerId || '');
+      if (customerId && cid !== customerId) continue;
+      if (loanId && lid !== loanId) continue;
+      const date = String(payment?.date || '');
+      if (from && date < from) continue;
+      if (to && date > to) continue;
+      if (mode && String(payment?.mode || '').toLowerCase() !== mode) continue;
+      const name = [customer?.firstName, customer?.middleName, customer?.lastName].filter(Boolean).join(' ') || String(customer?.name || '');
+      const haystack = [payment.id, payment.date, payment.loanId, loan?.khataNo, loan?.legacyKhataNo, loan?.id, cid, name, customer?.mobile, customer?.reference].join(' ').toLowerCase();
+      if (search && !haystack.includes(search)) continue;
+      rows.push({ ...payment, loan, customer });
+    }
+    rows.sort((a, b) => String(b.date || '').localeCompare(String(a.date || '')) || String(b.id || '').localeCompare(String(a.id || '')));
+    const total = rows.length;
+    const totalCollection = rows.reduce((sum, p) => sum + Number(p.total || 0), 0);
+    const principal = rows.reduce((sum, p) => sum + Number(p.principal || 0), 0);
+    const interest = rows.reduce((sum, p) => sum + Number(p.interest || 0), 0);
+    const penalty = rows.reduce((sum, p) => sum + Number(p.penalty || 0), 0);
+    const loanMap = new Map();
+    for (const row of rows) if (row.loan) loanMap.set(String(row.loan.id), row.loan);
+    const loanAmount = [...loanMap.values()].reduce((sum, l) => sum + Number(l.amount || 0), 0);
+    const principalPaidByLoan = new Map();
+    for (const p of payments) {
+      const lid = String(p?.loanId || '');
+      if (!lid) continue;
+      principalPaidByLoan.set(lid, (principalPaidByLoan.get(lid) || 0) + Number(p?.principal || 0));
+    }
+    const remaining = [...loanMap.values()].reduce((sum, l) => sum + Math.max(0, Number(l.amount || 0) - (principalPaidByLoan.get(String(l.id)) || 0)), 0);
+    const totalPages = Math.max(1, Math.ceil(total / limit));
+    const safePage = Math.min(page, totalPages);
+    const start = (safePage - 1) * limit;
+    const data = rows.slice(start, start + limit);
+    return send(res, 200, {
+      payments: data,
+      summary: { transactions: total, totalCollection, principal, interest, penalty, loanAmount, remaining, matchingLoans: loanMap.size },
+      pagination: { page: safePage, limit, total, totalPages, hasNext: safePage < totalPages, hasPrevious: safePage > 1 },
+      user: u
+    });
+  }
+
   if (method === 'GET' && parts[1] === 'customers' && parts[2]) {
     const u = await sessionUser(req);
     if (!u) return send(res, 401, { error: 'Authentication required' });

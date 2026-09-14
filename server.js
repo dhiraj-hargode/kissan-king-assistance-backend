@@ -1869,7 +1869,7 @@ async function api(req, res) {
 
   res.writeHead(200, {
     'Content-Type': 'text/csv; charset=utf-8',
-    'Content-Disposition': `attachment; filename="payments-${todayISO()}.csv"`,
+    'Content-Disposition': `attachment; filename="payments-${new Date().toISOString().slice(0, 10)}.csv"`,
     'Cache-Control': 'no-store'
   });
 
@@ -3046,7 +3046,7 @@ async function api(req, res) {
     const csv = [header, ...rows].map(row => row.map(escCsv).join(',')).join('\n');
     res.writeHead(200, {
       'Content-Type': 'text/csv; charset=utf-8',
-      'Content-Disposition': `attachment; filename="payments-${todayISO()}.csv"`,
+      'Content-Disposition': `attachment; filename="payments-${new Date().toISOString().slice(0, 10)}.csv"`,
       'Cache-Control': 'no-store'
     });
     return res.end(csv);

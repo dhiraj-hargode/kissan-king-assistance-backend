@@ -1815,532 +1815,82 @@ async function api(req, res) {
     const u = await sessionUser(req);
     if (!u) return send(res, 401, { error: 'Authentication required' });
     const paymentId = decodeURIComponent(parts[2]);
-    const d = await userData(u.userId);
-    const payments = Array.isArray(d.payments) ? d.payments : [];
-    const loans = Array.isArray(d.loans) ? d.loans : [];
-    const customers = Array.isArray(d.customers) ? d.customers : [];
-    const schedules = Array.isArray(d.schedules) ? d.schedules : [];
-    const payment = payments.find(p => String(p?.id) === String(paymentId));
-    if (!payment) return send(res, 404, { error: 'Payment not found' });
-    const loan = loans.find(l => String(l?.id) === String(payment.loanId)) || null;
-    const customer = loan ? customers.find(c => String(c?.id) === String(loan.customerId)) || null : null;
-    const schedule = payment.scheduleId
-      ? schedules.find(s => String(s?.id) === String(payment.scheduleId)) || null
-      : null;
-    return send(res, 200, { payment, loan, customer, schedule, user: u });
+    const result = await db.query(`
+      SELECT p.data_json AS payment_json, l.data_json AS loan_json,
+             c.data_json AS customer_json, s.data_json AS schedule_json
+      FROM payments p
+      LEFT JOIN loans l ON l.id=p.loan_id
+      LEFT JOIN customers c ON c.id=l.customer_id
+      LEFT JOIN schedules s ON s.id=p.schedule_id
+      WHERE p.id=$1 OR p.data_json->>'id'=$1
+      LIMIT 1
+    `,[paymentId]);
+    if(!result.rows.length) return send(res,404,{error:'Payment not found'});
+    const r=result.rows[0];
+    return send(res,200,{payment:rowJson(r.payment_json),loan:r.loan_json?rowJson(r.loan_json):null,customer:r.customer_json?rowJson(r.customer_json):null,schedule:r.schedule_json?rowJson(r.schedule_json):null,user:u});
   }
 
   if (method === 'GET' && parts[1] === 'payments' && !parts[2]) {
-    const u = await sessionUser(req);
-    if (!u) return send(res, 401, { error: 'Authentication required' });
-    const url = new URL(req.url, 'http://localhost');
-    const rawPage = Number.parseInt(url.searchParams.get('page') || '1', 10);
-    const rawLimit = Number.parseInt(url.searchParams.get('limit') || '50', 10);
-    const page = Number.isFinite(rawPage) ? Math.max(1, rawPage) : 1;
-    const limit = Number.isFinite(rawLimit) ? Math.min(100, Math.max(1, rawLimit)) : 50;
-    const search = String(url.searchParams.get('search') || '').trim().toLowerCase().slice(0, 100);
-    const from = isoDateFromQuery(url.searchParams.get('from'));
-    const to = isoDateFromQuery(url.searchParams.get('to'));
-    const mode = String(url.searchParams.get('mode') || '').trim().toLowerCase().slice(0, 50);
-    const customerId = String(url.searchParams.get('customerId') || '').trim();
-    const loanId = String(url.searchParams.get('loanId') || '').trim();
-    const d = await userData(u.userId);
-    const payments = Array.isArray(d.payments) ? d.payments : [];
-    const loans = Array.isArray(d.loans) ? d.loans : [];
-    const customers = Array.isArray(d.customers) ? d.customers : [];
-    const loanById = new Map(loans.map(l => [String(l.id), l]));
-    const customerById = new Map(customers.map(c => [String(c.id), c]));
-    const rows = [];
-    for (const payment of payments) {
-      const lid = String(payment?.loanId || '');
-      const loan = loanById.get(lid) || null;
-      const customer = loan ? customerById.get(String(loan.customerId)) || null : null;
-      const cid = String(loan?.customerId || '');
-      if (customerId && cid !== customerId) continue;
-      if (loanId && lid !== loanId) continue;
-      const date = String(payment?.date || '');
-      if (from && date < from) continue;
-      if (to && date > to) continue;
-      if (mode && String(payment?.mode || '').toLowerCase() !== mode) continue;
-      const name = [customer?.firstName, customer?.middleName, customer?.lastName].filter(Boolean).join(' ') || String(customer?.name || '');
-      const haystack = [payment.id, payment.date, payment.loanId, loan?.khataNo, loan?.legacyKhataNo, loan?.id, cid, name, customer?.mobile, customer?.reference].join(' ').toLowerCase();
-      if (search && !haystack.includes(search)) continue;
-      rows.push({ ...payment, loan, customer });
-    }
-    rows.sort((a, b) => String(b.date || '').localeCompare(String(a.date || '')) || String(b.id || '').localeCompare(String(a.id || '')));
-    const total = rows.length;
-    const totalCollection = rows.reduce((sum, p) => sum + Number(p.total || 0), 0);
-    const principal = rows.reduce((sum, p) => sum + Number(p.principal || 0), 0);
-    const interest = rows.reduce((sum, p) => sum + Number(p.interest || 0), 0);
-    const penalty = rows.reduce((sum, p) => sum + Number(p.penalty || 0), 0);
-    const loanMap = new Map();
-    for (const row of rows) if (row.loan) loanMap.set(String(row.loan.id), row.loan);
-    const loanAmount = [...loanMap.values()].reduce((sum, l) => sum + Number(l.amount || 0), 0);
-    const principalPaidByLoan = new Map();
-    for (const p of payments) {
-      const lid = String(p?.loanId || '');
-      if (!lid) continue;
-      principalPaidByLoan.set(lid, (principalPaidByLoan.get(lid) || 0) + Number(p?.principal || 0));
-    }
-    const remaining = [...loanMap.values()].reduce((sum, l) => sum + Math.max(0, Number(l.amount || 0) - (principalPaidByLoan.get(String(l.id)) || 0)), 0);
-    const totalPages = Math.max(1, Math.ceil(total / limit));
-    const safePage = Math.min(page, totalPages);
-    const start = (safePage - 1) * limit;
-    const data = rows.slice(start, start + limit);
-    return send(res, 200, {
-      payments: data,
-      summary: { transactions: total, totalCollection, principal, interest, penalty, loanAmount, remaining, matchingLoans: loanMap.size },
-      pagination: { page: safePage, limit, total, totalPages, hasNext: safePage < totalPages, hasPrevious: safePage > 1 },
-      user: u
-    });
-  }
-
-  // Targeted collections read APIs. Data is sourced from normalized PostgreSQL via userData().
-  if (method === 'GET' && parts[1] === 'collections' && parts[2] === 'today') {
-    const u = await sessionUser(req);
-    if (!u) return send(res, 401, { error: 'Authentication required' });
-    const url = new URL(req.url, 'http://localhost');
-    const selected = isoDateFromQuery(url.searchParams.get('date'));
-    const search = String(url.searchParams.get('search') || '').trim().toLowerCase().slice(0, 100);
-    const d = await userData(u.userId);
-    const customers = Array.isArray(d.customers) ? d.customers : [];
-    const loans = Array.isArray(d.loans) ? d.loans : [];
-    const schedules = Array.isArray(d.schedules) ? d.schedules : [];
-    const payments = Array.isArray(d.payments) ? d.payments : [];
-    const expired = new Set((Array.isArray(d.expiredCustomers) ? d.expiredCustomers : []).map(x => String(x?.customerId || x?.id || '')));
-    const pendingIds = new Set((Array.isArray(d.pendingQueue) ? d.pendingQueue : []).map(String));
-    const customerById = new Map(customers.map(c => [String(c.id), c]));
-    const loanById = new Map(loans.map(l => [String(l.id), l]));
-    const loanCustomer = l => l ? customerById.get(String(l.customerId)) || null : null;
-    const scheduleTotals = new Map();
-    for (const p of payments) {
-      const sid = String(p?.scheduleId || '').trim();
-      if (!sid) continue;
-      const x = scheduleTotals.get(sid) || { principalInterest: 0, penalty: 0 };
-      x.principalInterest += Number(p?.principal || 0) + Number(p?.interest || 0);
-      x.penalty += Number(p?.penalty || 0);
-      scheduleTotals.set(sid, x);
-    }
-    const scheduleDue = s => {
-      const t = scheduleTotals.get(String(s?.id)) || { principalInterest: 0, penalty: 0 };
-      const installment = Math.max(0, Number(s?.emi || 0) - Math.max(Number(s?.paid || 0), t.principalInterest));
-      const unpaidPenalty = Math.max(0, Number(s?.penalty || 0) - t.penalty);
-      return Number((installment + unpaidPenalty).toFixed(2));
-    };
-    const byLoan = new Map();
-    for (const s of schedules) {
-      if (String(s?.dueDate || '') !== selected || s?.manualPending) continue;
-      const l = loanById.get(String(s?.loanId || ''));
-      if (!l || expired.has(String(l.customerId))) continue;
-      const due = scheduleDue(s);
-      const sid = String(s.id);
-      const t = scheduleTotals.get(sid) || { principalInterest: 0, penalty: 0 };
-      const status = due <= 0.005 ? 'PAID' : String(s.dueDate) < selected ? 'OVERDUE' : String(s.dueDate) === selected ? 'DUE TODAY' : 'UPCOMING';
-      const row = byLoan.get(String(l.id)) || { loan: l, customer: loanCustomer(l), schedules: [], due: 0, grossDue: 0, paidOnDate: 0, fullyPaidInstallment: true, hasPaidSchedule: false };
-      row.schedules.push(s);
-      row.due += due;
-      row.grossDue += Number(s?.emi || 0) + Number(s?.penalty || 0);
-      row.fullyPaidInstallment = row.fullyPaidInstallment && due <= 0.005;
-      row.hasPaidSchedule = row.hasPaidSchedule || status === 'PAID';
-      byLoan.set(String(l.id), row);
-    }
-    const paymentBySchedule = new Map();
-    const paymentByLoan = new Map();
-    const principalByLoan = new Map();
-    for (const p of payments) {
-      const plid = String(p?.loanId || '');
-      principalByLoan.set(plid, (principalByLoan.get(plid) || 0) + Number(p?.principal || 0));
-      if (String(p?.date || '') !== selected) continue;
-      const lid = String(p?.loanId || '');
-      const sid = String(p?.scheduleId || '').trim();
-      if (sid) paymentBySchedule.set(sid, (paymentBySchedule.get(sid) || 0) + Number(p?.total || 0));
-      paymentByLoan.set(lid, (paymentByLoan.get(lid) || 0) + Number(p?.total || 0));
-    }
-    const rows = [];
-    for (const row of byLoan.values()) {
-      const l = row.loan, c = row.customer;
-      row.loan = { ...l, paidPrincipal: principalByLoan.get(String(l.id)) || 0 };
-      row.paidOnDate = row.schedules.reduce((sum, s) => sum + (paymentBySchedule.get(String(s.id)) || 0), 0);
-      const fullyPaidToday = row.fullyPaidInstallment || (row.paidOnDate > 0 && row.grossDue > 0 && row.paidOnDate >= row.grossDue - 0.005);
-      const visible = !row.schedules.some(s => pendingIds.has(String(s.id))) || row.fullyPaidInstallment;
-      if (!visible) continue;
-      const haystack = [l?.legacyKhataNo, l?.khataNo, l?.id, c?.id, c?.mobile, c?.reference, c?.firstName, c?.middleName, c?.lastName, c?.city, c?.district].filter(Boolean).join(' ').toLowerCase();
-      if (search && !haystack.includes(search)) continue;
-      const unpaid = row.schedules.find(s => scheduleDue(s) > 0.005) || row.schedules[0];
-      rows.push({ ...row, s: unpaid, due: row.fullyPaidInstallment ? 0 : Number(Math.max(0, row.due - row.paidOnDate).toFixed(2)), fullyPaidToday });
-    }
-    rows.sort((a,b) => String(a.loan?.id || '').localeCompare(String(b.loan?.id || '')));
-    const allocated = payments.filter(p => String(p?.date || '') === selected && (!p.scheduleId || rows.some(r => r.schedules.some(s => String(s.id) === String(p.scheduleId)))));
-    return send(res, 200, {
-      date: selected,
-      rows,
-      summary: {
-        entries: rows.length,
-        expected: rows.reduce((sum,r) => sum + Number(r.grossDue || 0), 0),
-        collected: allocated.reduce((sum,p) => sum + Number(p.total || 0), 0),
-        interest: allocated.reduce((sum,p) => sum + Number(p.interest || 0), 0),
-        pending: rows.reduce((sum,r) => sum + Number(r.due || 0), 0)
-      },
-      user: u
-    });
-  }
-
-  if (method === 'GET' && parts[1] === 'collections' && parts[2] === 'pending') {
-    const u = await sessionUser(req);
-    if (!u) return send(res, 401, { error: 'Authentication required' });
-    const url = new URL(req.url, 'http://localhost');
-    const rawPage = Number.parseInt(url.searchParams.get('page') || '1', 10);
-    const rawLimit = Number.parseInt(url.searchParams.get('limit') || '50', 10);
-    const page = Number.isFinite(rawPage) ? Math.max(1, rawPage) : 1;
-    const limit = Number.isFinite(rawLimit) ? Math.min(100, Math.max(1, rawLimit)) : 50;
-    const search = String(url.searchParams.get('search') || '').trim().toLowerCase().slice(0, 100);
-    const asOf = isoDateFromQuery(url.searchParams.get('date'));
-    const d = await userData(u.userId);
-    const customers = Array.isArray(d.customers) ? d.customers : [];
-    const loans = Array.isArray(d.loans) ? d.loans : [];
-    const schedules = Array.isArray(d.schedules) ? d.schedules : [];
-    const payments = Array.isArray(d.payments) ? d.payments : [];
-    const expired = new Set((Array.isArray(d.expiredCustomers) ? d.expiredCustomers : []).map(x => String(x?.customerId || x?.id || '')));
-    const pendingIds = new Set((Array.isArray(d.pendingQueue) ? d.pendingQueue : []).map(String));
-    const customerById = new Map(customers.map(c => [String(c.id), c]));
-    const loanById = new Map(loans.map(l => [String(l.id), l]));
-    const totals = new Map();
-    for (const p of payments) {
-      const sid = String(p?.scheduleId || '').trim();
-      if (!sid) continue;
-      const x = totals.get(sid) || { principalInterest: 0, penalty: 0 };
-      x.principalInterest += Number(p?.principal || 0) + Number(p?.interest || 0);
-      x.penalty += Number(p?.penalty || 0);
-      totals.set(sid, x);
-    }
-    const due = s => {
-      const t = totals.get(String(s?.id)) || { principalInterest: 0, penalty: 0 };
-      return Number((Math.max(0, Number(s?.emi || 0) - Math.max(Number(s?.paid || 0), t.principalInterest)) + Math.max(0, Number(s?.penalty || 0) - t.penalty)).toFixed(2));
-    };
-    const rows = [];
-    for (const s of schedules) {
-      if (!pendingIds.has(String(s?.id)) || !s?.pendingAddedAt) continue;
-      const l = loanById.get(String(s?.loanId || ''));
-      if (!l || expired.has(String(l.customerId))) continue;
-      const c = customerById.get(String(l.customerId)) || null;
-      const pending = due(s);
-      if (pending <= 0.005 || String(l.status || '').toUpperCase() === 'CLOSED') continue;
-      const status = String(s.dueDate) < asOf ? 'OVERDUE' : String(s.dueDate) === asOf ? 'DUE TODAY' : 'UPCOMING';
-      const khata = l?.legacyKhataNo || l?.khataNo || l?.id || '-';
-      const haystack = [c?.firstName,c?.middleName,c?.lastName,c?.mobile,c?.id,khata,l?.id,status].filter(Boolean).join(' ').toLowerCase();
-      if (search && !haystack.includes(search)) continue;
-      rows.push({ schedule:s, loan:l, customer:c, pending, status, daysLate: Math.max(0, Math.floor((new Date(asOf+'T00:00:00') - new Date(String(s.dueDate)+'T00:00:00')) / 86400000)) });
-    }
-    rows.sort((a,b) => String(b.schedule?.dueDate || '').localeCompare(String(a.schedule?.dueDate || '')));
-    const total = rows.length;
-    const totalPages = Math.max(1, Math.ceil(total / limit));
-    const safePage = Math.min(page, totalPages);
-    const start = (safePage - 1) * limit;
-    const data = rows.slice(start, start + limit);
-    const overdue = rows.filter(r => r.status === 'OVERDUE');
-    const dueToday = rows.filter(r => r.status === 'DUE TODAY');
-    return send(res, 200, {
-      rows: data,
-      summary: { totalPending: rows.reduce((sum,r) => sum + r.pending, 0), overdueLoans: new Set(overdue.map(r => r.loan.id)).size, overdueEmis: overdue.length, dueToday: dueToday.reduce((sum,r) => sum + r.pending, 0) },
-      pagination: { page:safePage, limit, total, totalPages, hasNext:safePage<totalPages, hasPrevious:safePage>1 },
-      user:u
-    });
-  }
-
-  if (method === 'GET' && parts[1] === 'customers' && parts[2]) {
-    const u = await sessionUser(req);
-    if (!u) return send(res, 401, { error: 'Authentication required' });
-    const customerId = decodeURIComponent(parts[2]);
-
-    // Phase 3.2: read customer details directly from normalized PostgreSQL.
-    // The original JSON object is preserved in data_json so the frontend
-    // contract remains compatible while the large user_data JSONB document
-    // is no longer loaded for this request.
-    const customerResult = await db.query(`
-      SELECT
-        c.data_json AS customer_json,
-        COALESCE(ls.loan_count, 0)::int AS loan_count,
-        COALESCE(ls.total_loan, 0)::numeric AS total_loan,
-        COALESCE(ps.payment_count, 0)::int AS payment_count,
-        COALESCE(ss.schedule_count, 0)::int AS schedule_count,
-        b.data_json AS blacklist_json,
-        e.data_json AS expired_json
-      FROM customers c
-      LEFT JOIN (
-        SELECT customer_id, COUNT(*)::int AS loan_count, COALESCE(SUM(amount),0)::numeric AS total_loan
-        FROM loans GROUP BY customer_id
-      ) ls ON ls.customer_id = c.id
-      LEFT JOIN (
-        SELECT l.customer_id, COUNT(p.*)::int AS payment_count
-        FROM loans l JOIN payments p ON p.loan_id = l.id
-        WHERE l.customer_id = $1
-        GROUP BY l.customer_id
-      ) ps ON ps.customer_id = c.id
-      LEFT JOIN (
-        SELECT l.customer_id, COUNT(s.*)::int AS schedule_count
-        FROM loans l JOIN schedules s ON s.loan_id = l.id
-        WHERE l.customer_id = $1
-        GROUP BY l.customer_id
-      ) ss ON ss.customer_id = c.id
-      LEFT JOIN LATERAL (
-        SELECT data_json FROM blacklist WHERE customer_id = c.id ORDER BY created_at DESC NULLS LAST LIMIT 1
-      ) b ON TRUE
-      LEFT JOIN LATERAL (
-        SELECT data_json FROM expired_customers WHERE customer_id = c.id ORDER BY expired_date DESC NULLS LAST LIMIT 1
-      ) e ON TRUE
-      WHERE c.id = $1
-      LIMIT 1
-    `, [customerId]);
-
-    if (!customerResult.rows.length) return send(res, 404, { error: 'Customer not found' });
-    const row = customerResult.rows[0];
-    const customer = typeof row.customer_json === 'string' ? JSON.parse(row.customer_json) : (row.customer_json || {});
-
-    const loansResult = await db.query(`
-      SELECT data_json
-      FROM loans
-      WHERE customer_id = $1
-      ORDER BY start_date DESC NULLS LAST, id DESC
-    `, [customerId]);
-    const loans = loansResult.rows.map(r => typeof r.data_json === 'string' ? JSON.parse(r.data_json) : r.data_json);
-    const loanIds = loans.map(l => String(l?.id || '')).filter(Boolean);
-
-    let payments = [], schedules = [];
-    if (loanIds.length) {
-      const [paymentResult, scheduleResult] = await Promise.all([
-        db.query(`SELECT data_json FROM payments WHERE loan_id = ANY($1::text[]) ORDER BY payment_date DESC NULLS LAST, id DESC`, [loanIds]),
-        db.query(`SELECT data_json FROM schedules WHERE loan_id = ANY($1::text[]) ORDER BY due_date DESC NULLS LAST, id DESC`, [loanIds])
-      ]);
-      payments = paymentResult.rows.map(r => typeof r.data_json === 'string' ? JSON.parse(r.data_json) : r.data_json);
-      schedules = scheduleResult.rows.map(r => typeof r.data_json === 'string' ? JSON.parse(r.data_json) : r.data_json);
-    }
-
-    const blacklist = row.blacklist_json ? (typeof row.blacklist_json === 'string' ? JSON.parse(row.blacklist_json) : row.blacklist_json) : null;
-    const expired = row.expired_json ? (typeof row.expired_json === 'string' ? JSON.parse(row.expired_json) : row.expired_json) : null;
-
-    return send(res, 200, {
-      customer,
-      loans,
-      payments,
-      schedules,
-      blacklist,
-      expired,
-      summary: {
-        loanCount: Number(row.loan_count || 0),
-        totalLoan: Number(row.total_loan || 0),
-        paymentCount: Number(row.payment_count || 0),
-        scheduleCount: Number(row.schedule_count || 0)
-      },
-      user: u
-    });
-  }
-
-  // Loan reads are backed by normalized PostgreSQL via userData().
-  if (method === 'GET' && parts[1] === 'loans' && parts[2]) {
-    const u = await sessionUser(req);
-    if (!u) return send(res, 401, { error: 'Authentication required' });
-    const loanId = decodeURIComponent(parts[2]);
-    const d = await userData(u.userId);
-    const customers = Array.isArray(d.customers) ? d.customers : [];
-    const loans = Array.isArray(d.loans) ? d.loans : [];
-    const payments = Array.isArray(d.payments) ? d.payments : [];
-    const schedules = Array.isArray(d.schedules) ? d.schedules : [];
-    const loan = loans.find(l => String(l?.id) === String(loanId));
-    if (!loan) return send(res, 404, { error: 'Loan not found' });
-    const customer = customers.find(c => String(c?.id) === String(loan.customerId)) || null;
-    const loanPayments = payments.filter(p => String(p?.loanId) === String(loanId));
-    const loanSchedules = schedules.filter(s => String(s?.loanId) === String(loanId));
-    const paidPrincipal = loanPayments.reduce((sum, p) => sum + Number(p?.principal || 0), 0);
-    const totalPaid = loanPayments.reduce((sum, p) => sum + Number(p?.total || 0), 0);
-    const outstanding = Math.max(0, Number(loan.amount || 0) - paidPrincipal);
-    const today = isoDateFromQuery(new URL(req.url, 'http://localhost').searchParams.get('date'));
-    const next = loanSchedules
-      .filter(s => Number(s?.emi || 0) - Number(s?.paid || 0) > 0.005 && String(s?.dueDate || '') >= today)
-      .sort((a, b) => String(a?.dueDate || '').localeCompare(String(b?.dueDate || '')))[0] || null;
-    const overdue = loanSchedules.some(s => String(s?.dueDate || '') < today && String(s?.status || '').toUpperCase() !== 'PAID' && (Number(s?.emi || 0) - Number(s?.paid || 0) > 0.005));
-    const status = outstanding <= 0.005 ? 'CLOSED' : String(loan.status || '').toUpperCase() === 'DEAD' ? 'DEAD' : overdue ? 'OVERDUE' : 'ACTIVE';
-    return send(res, 200, {
-      loan,
-      customer,
-      payments: loanPayments,
-      schedules: loanSchedules,
-      summary: { paidPrincipal, totalPaid, outstanding, status, nextDue: next?.dueDate || null },
-      user: u
-    });
-  }
-
-  if (method === 'GET' && parts[1] === 'loans' && !parts[2]) {
-    const u = await sessionUser(req);
-    if (!u) return send(res, 401, { error: 'Authentication required' });
-    const url = new URL(req.url, 'http://localhost');
-    const rawPage = Number.parseInt(url.searchParams.get('page') || '1', 10);
-    const rawLimit = Number.parseInt(url.searchParams.get('limit') || '50', 10);
-    const page = Number.isFinite(rawPage) ? Math.max(1, rawPage) : 1;
-    const limit = Number.isFinite(rawLimit) ? Math.min(100, Math.max(1, rawLimit)) : 50;
-    const search = String(url.searchParams.get('search') || '').trim().toLowerCase().slice(0, 100);
-    const statusFilter = String(url.searchParams.get('status') || '').trim().toUpperCase();
-    const sort = String(url.searchParams.get('sort') || 'startDate');
-    const order = String(url.searchParams.get('order') || 'desc').toLowerCase() === 'asc' ? 'asc' : 'desc';
-    const d = await userData(u.userId);
-    const customers = Array.isArray(d.customers) ? d.customers : [];
-    const loans = Array.isArray(d.loans) ? d.loans : [];
-    const payments = Array.isArray(d.payments) ? d.payments : [];
-    const schedules = Array.isArray(d.schedules) ? d.schedules : [];
-    const expiredIds = new Set((d.expiredCustomers || []).map(x => String(x.customerId || x.id || '')));
-    const customerById = new Map(customers.map(c => [String(c.id), c]));
-    const paidPrincipalByLoan = new Map();
-    for (const payment of payments) {
-      const lid = String(payment?.loanId || '');
-      paidPrincipalByLoan.set(lid, (paidPrincipalByLoan.get(lid) || 0) + Number(payment?.principal || 0));
-    }
-    const schedulesByLoan = new Map();
-    for (const schedule of schedules) {
-      const lid = String(schedule?.loanId || '');
-      if (!schedulesByLoan.has(lid)) schedulesByLoan.set(lid, []);
-      schedulesByLoan.get(lid).push(schedule);
-    }
-    const today = isoDateFromQuery(url.searchParams.get('date'));
-    const rows = [];
-    for (const loan of loans) {
-      const customerId = String(loan?.customerId || '');
-      if (!customerId || expiredIds.has(customerId)) continue;
-      const customer = customerById.get(customerId) || {};
-      const paid = paidPrincipalByLoan.get(String(loan.id)) || 0;
-      const remaining = Math.max(0, Number(loan.amount || 0) - paid);
-      const loanSchedules = schedulesByLoan.get(String(loan.id)) || [];
-      const overdue = remaining > 0.005 && loanSchedules.some(s => String(s?.dueDate || '') < today && String(s?.status || '').toUpperCase() !== 'PAID' && (Number(s?.emi || 0) - Number(s?.paid || 0) > 0.005));
-      const status = remaining <= 0.005 ? 'COMPLETED' : String(loan.status || '').toUpperCase() === 'DEAD' ? 'DEAD' : overdue ? 'OVERDUE' : 'ACTIVE';
-      const name = [customer.firstName, customer.middleName, customer.lastName].filter(Boolean).join(' ');
-      const haystack = [loan.id, loan.khataNo, loan.legacyKhataNo, name, customer.mobile, customer.id, customer.city, customer.district, loan.loanType, loan.loanAgainst, status].join(' ').toLowerCase();
-      if (search && !haystack.includes(search)) continue;
-      if (statusFilter && status !== statusFilter) continue;
-      rows.push({ loan, customer, remaining, status });
-    }
-    const total = rows.length;
-    const totalPages = Math.max(1, Math.ceil(total / limit));
-    const safePage = Math.min(page, totalPages);
-    const valueForSort = row => {
-      if (sort === 'amount') return Number(row.loan.amount || 0);
-      if (sort === 'remaining') return Number(row.remaining || 0);
-      if (sort === 'customer') return [row.customer.firstName, row.customer.middleName, row.customer.lastName].filter(Boolean).join(' ').toLowerCase();
-      if (sort === 'status') return row.status;
-      return String(row.loan.startDate || '');
-    };
-    rows.sort((a, b) => {
-      const av = valueForSort(a), bv = valueForSort(b);
-      const cmp = typeof av === 'number' && typeof bv === 'number' ? av - bv : String(av).localeCompare(String(bv));
-      return order === 'asc' ? cmp : -cmp;
-    });
-    const start = (safePage - 1) * limit;
-    const data = rows.slice(start, start + limit).map(r => ({
-      ...r.loan,
-      customer: r.customer,
-      remaining: r.remaining,
-      computedStatus: r.status
-    }));
-    return send(res, 200, {
-      loans: data,
-      pagination: { page: safePage, limit, total, totalPages, hasNext: safePage < totalPages, hasPrevious: safePage > 1 },
-      user: u
-    });
-  }
-
-
-  // Paginated overdue-installment list. This is separate from the explicit
-  // Pending queue because Overdue Loans historically includes every overdue
-  // unpaid schedule, whether or not it was manually added to Pending.
-  if (method === 'GET' && parts[1] === 'overdue' && !parts[2]) {
     const u=await sessionUser(req); if(!u)return send(res,401,{error:'Authentication required'});
     const url=new URL(req.url,'http://localhost');
     const page=Math.max(1,Number.parseInt(url.searchParams.get('page')||'1',10)||1);
     const limit=Math.min(100,Math.max(1,Number.parseInt(url.searchParams.get('limit')||'50',10)||50));
     const search=String(url.searchParams.get('search')||'').trim().toLowerCase().slice(0,100);
-    const date=isoDateFromQuery(url.searchParams.get('date'));
-    const d=await userData(u.userId),customers=Array.isArray(d.customers)?d.customers:[],loans=Array.isArray(d.loans)?d.loans:[],schedules=Array.isArray(d.schedules)?d.schedules:[],payments=Array.isArray(d.payments)?d.payments:[];
-    const expiredIds=new Set((d.expiredCustomers||[]).map(x=>String(x.customerId||x.id||''))),byId=new Map(customers.map(c=>[String(c.id),c])),loanById=new Map(loans.map(l=>[String(l.id),l])),paidBySchedule=new Map(),paidByLoan=new Map();
-    for(const pay of payments){const sid=String(pay.scheduleId||'');const lid=String(pay.loanId||'');const total=Number(pay.total||0);if(sid)paidBySchedule.set(sid,(paidBySchedule.get(sid)||0)+total);if(lid)paidByLoan.set(lid,(paidByLoan.get(lid)||0)+Number(pay.principal||0));}
-    const rows=[];
-    for(const sch of schedules){const loan=loanById.get(String(sch.loanId));if(!loan||expiredIds.has(String(loan.customerId)))continue;const customer=byId.get(String(loan.customerId))||{};const scheduled=Math.max(0,Number(sch.emi||0));const paid=Math.max(Number(sch.paid||0),paidBySchedule.get(String(sch.id))||0);const pending=Math.max(0,scheduled-paid);if(!String(sch.dueDate||'')||String(sch.dueDate)>=date||pending<=0.005)continue;const hay=[loan.id,loan.khataNo,loan.legacyKhataNo,loan.customerId,customer.id,customer.firstName,customer.middleName,customer.lastName,customer.name,customer.mobile].join(' ').toLowerCase();if(search&&!hay.includes(search))continue;rows.push({schedule:sch,loan,customer,pending,daysLate:Math.max(0,Math.floor((new Date(date+'T00:00:00')-new Date(String(sch.dueDate)+'T00:00:00'))/86400000)),status:'OVERDUE'});}
-    rows.sort((a,b)=>String(a.schedule.dueDate).localeCompare(String(b.schedule.dueDate)));
-    const total=rows.length,totalPages=Math.max(1,Math.ceil(total/limit)),safePage=Math.min(page,totalPages),start=(safePage-1)*limit;
-    return send(res,200,{rows:rows.slice(start,start+limit),pagination:{page:safePage,limit,total,totalPages,hasNext:safePage<totalPages,hasPrevious:safePage>1},user:u});
+    const from=isoDateFromQuery(url.searchParams.get('from')); const to=isoDateFromQuery(url.searchParams.get('to'));
+    const mode=String(url.searchParams.get('mode')||'').trim().toLowerCase().slice(0,50);
+    const customerId=String(url.searchParams.get('customerId')||'').trim(); const loanId=String(url.searchParams.get('loanId')||'').trim();
+    const q=`%${search.replace(/[%_\\]/g,'\\$&')}%`;
+    const where=`WHERE ($1='' OR p.id ILIKE $2 ESCAPE '\\' OR COALESCE(p.data_json->>'date','') ILIKE $2 ESCAPE '\\' OR p.loan_id ILIKE $2 ESCAPE '\\' OR COALESCE(l.khata_no,'') ILIKE $2 ESCAPE '\\' OR COALESCE(l.data_json->>'legacyKhataNo','') ILIKE $2 ESCAPE '\\' OR l.id ILIKE $2 ESCAPE '\\' OR c.id ILIKE $2 ESCAPE '\\' OR COALESCE(c.name,'') ILIKE $2 ESCAPE '\\' OR COALESCE(c.first_name,'') ILIKE $2 ESCAPE '\\' OR COALESCE(c.middle_name,'') ILIKE $2 ESCAPE '\\' OR COALESCE(c.last_name,'') ILIKE $2 ESCAPE '\\' OR COALESCE(c.mobile,'') ILIKE $2 ESCAPE '\\') AND ($3='' OR l.customer_id=$3) AND ($4='' OR p.loan_id=$4) AND ($5::date IS NULL OR p.payment_date>=$5::date) AND ($6::date IS NULL OR p.payment_date<=$6::date) AND ($7='' OR LOWER(COALESCE(p.mode,''))=$7)`;
+    const params=[search,q,customerId,loanId,from||null,to||null,mode];
+    const [countR,rowsR,sumR]=await Promise.all([
+      db.query(`SELECT COUNT(*)::int AS total FROM payments p JOIN loans l ON l.id=p.loan_id JOIN customers c ON c.id=l.customer_id ${where}`,params),
+      db.query(`SELECT p.data_json AS payment_json,l.data_json AS loan_json,c.data_json AS customer_json FROM payments p JOIN loans l ON l.id=p.loan_id JOIN customers c ON c.id=l.customer_id ${where} ORDER BY p.payment_date DESC NULLS LAST,p.id DESC LIMIT $8 OFFSET $9`,[...params,limit,(page-1)*limit]),
+      db.query(`SELECT COUNT(*)::int AS transactions,COALESCE(SUM(p.total),0)::numeric AS total_collection,COALESCE(SUM(p.principal),0)::numeric AS principal,COALESCE(SUM(p.interest),0)::numeric AS interest,COALESCE(SUM(p.penalty),0)::numeric AS penalty,COUNT(DISTINCT l.id)::int AS matching_loans,COALESCE(SUM(DISTINCT l.amount),0)::numeric AS loan_amount FROM payments p JOIN loans l ON l.id=p.loan_id JOIN customers c ON c.id=l.customer_id ${where}`,params)
+    ]);
+    const total=Number(countR.rows[0]?.total||0), totalPages=Math.max(1,Math.ceil(total/limit)), safePage=Math.min(page,totalPages), summary=sumR.rows[0]||{};
+    const loanIds=[...new Set(rowsR.rows.map(r=>String(rowJson(r.loan_json)?.id||'')).filter(Boolean))];
+    let remaining=0;
+    if(loanIds.length){const rr=await db.query(`SELECT COALESCE(SUM(GREATEST(0,l.amount-COALESCE(p.paid_principal,0))),0)::numeric AS remaining FROM loans l LEFT JOIN (SELECT loan_id,SUM(principal)::numeric AS paid_principal FROM payments GROUP BY loan_id)p ON p.loan_id=l.id WHERE l.id=ANY($1::text[])`,[loanIds]);remaining=Number(rr.rows[0]?.remaining||0);}
+    const payments=rowsR.rows.map(r=>({...rowJson(r.payment_json),loan:rowJson(r.loan_json),customer:rowJson(r.customer_json)}));
+    return send(res,200,{payments,summary:{transactions:Number(summary.transactions||0),totalCollection:Number(summary.total_collection||0),principal:Number(summary.principal||0),interest:Number(summary.interest||0),penalty:Number(summary.penalty||0),loanAmount:Number(summary.loan_amount||0),remaining,matchingLoans:Number(summary.matching_loans||0)},pagination:{page:safePage,limit,total,totalPages,hasNext:safePage<totalPages,hasPrevious:safePage>1},user:u});
   }
 
-  // Blacklist reads are backed by normalized PostgreSQL via userData().
-  if (method === 'GET' && parts[1] === 'blacklist' && !parts[2]) {
-    const u = await sessionUser(req);
-    if (!u) return send(res, 401, { error: 'Authentication required' });
-    const url = new URL(req.url, 'http://localhost');
-    const page = Math.max(1, Number.parseInt(url.searchParams.get('page') || '1', 10) || 1);
-    const limit = Math.min(100, Math.max(1, Number.parseInt(url.searchParams.get('limit') || '50', 10) || 50));
-    const search = String(url.searchParams.get('search') || '').trim().toLowerCase().slice(0, 100);
-    const d = await userData(u.userId);
-    const customers = Array.isArray(d.customers) ? d.customers : [];
-    const loans = Array.isArray(d.loans) ? d.loans : [];
-    const blacklist = Array.isArray(d.blacklist) ? d.blacklist : [];
-    const customerById = new Map(customers.map(c => [String(c.id), c]));
-    const loansByCustomer = new Map();
-    for (const l of loans) {
-      const cid = String(l.customerId || '');
-      if (!loansByCustomer.has(cid)) loansByCustomer.set(cid, []);
-      loansByCustomer.get(cid).push(l);
-    }
-    const rows = blacklist.map(b => {
-      const customer = customerById.get(String(b.customerId));
-      if (!customer) return null;
-      const customerLoans = loansByCustomer.get(String(customer.id)) || [];
-      const hay = [customer.id, customer.firstName, customer.middleName, customer.lastName, customer.name, customer.mobile, customer.city, b.reason, b.notes].join(' ').toLowerCase();
-      if (search && !hay.includes(search)) return null;
-      return { blacklist: b, customer, loanCount: customerLoans.length, outstanding: customerLoans.reduce((sum, l) => sum + Math.max(0, Number(l.amount || 0)), 0) };
-    }).filter(Boolean);
-    rows.sort((a,b) => String(a.customer.firstName || a.customer.name || a.customer.id).localeCompare(String(b.customer.firstName || b.customer.name || b.customer.id), undefined, {sensitivity:'base'}));
-    const total = rows.length, totalPages = Math.max(1, Math.ceil(total / limit)), safePage = Math.min(page, totalPages), start=(safePage-1)*limit;
-    return send(res, 200, { rows: rows.slice(start,start+limit), pagination:{page:safePage,limit,total,totalPages,hasNext:safePage<totalPages,hasPrevious:safePage>1}, user:u });
+  if (method === 'GET' && parts[1] === 'customers' && parts[2]) {
+    const u=await sessionUser(req); if(!u)return send(res,401,{error:'Authentication required'});
+    const customerId=decodeURIComponent(parts[2]);
+    const cr=await db.query(`SELECT c.id,c.data_json AS customer_json,(SELECT COUNT(*) FROM loans l WHERE l.customer_id=c.id)::int AS loan_count,(SELECT COALESCE(SUM(l.amount),0) FROM loans l WHERE l.customer_id=c.id)::numeric AS total_loan,(SELECT COUNT(*) FROM payments p JOIN loans l ON l.id=p.loan_id WHERE l.customer_id=c.id)::int AS payment_count,(SELECT COUNT(*) FROM schedules s JOIN loans l ON l.id=s.loan_id WHERE l.customer_id=c.id)::int AS schedule_count,(SELECT b.data_json FROM blacklist b WHERE b.customer_id=c.id ORDER BY b.created_at DESC NULLS LAST LIMIT 1) AS blacklist_json,(SELECT e.data_json FROM expired_customers e WHERE e.customer_id=c.id ORDER BY e.expired_date DESC NULLS LAST LIMIT 1) AS expired_json FROM customers c WHERE c.id=$1 OR c.data_json->>'id'=$1 LIMIT 1`,[customerId]);
+    if(!cr.rows.length)return send(res,404,{error:'Customer not found'});
+    const r=cr.rows[0],cid=String(r.id); const [lr,pr,sr]=await Promise.all([db.query(`SELECT data_json FROM loans WHERE customer_id=$1 ORDER BY start_date DESC NULLS LAST,id DESC`,[cid]),db.query(`SELECT p.data_json FROM payments p JOIN loans l ON l.id=p.loan_id WHERE l.customer_id=$1 ORDER BY p.payment_date DESC NULLS LAST,p.id DESC`,[cid]),db.query(`SELECT s.data_json FROM schedules s JOIN loans l ON l.id=s.loan_id WHERE l.customer_id=$1 ORDER BY s.due_date DESC NULLS LAST,s.id DESC`,[cid])]);
+    return send(res,200,{customer:rowJson(r.customer_json),loans:lr.rows.map(x=>rowJson(x.data_json)),payments:pr.rows.map(x=>rowJson(x.data_json)),schedules:sr.rows.map(x=>rowJson(x.data_json)),blacklist:r.blacklist_json?rowJson(r.blacklist_json):null,expired:r.expired_json?rowJson(r.expired_json):null,summary:{loanCount:Number(r.loan_count||0),totalLoan:Number(r.total_loan||0),paymentCount:Number(r.payment_count||0),scheduleCount:Number(r.schedule_count||0)},user:u});
   }
 
-  // Paginated expired/deceased customer list.
-  if (method === 'GET' && parts[1] === 'expired-people' && !parts[2]) {
-    const u = await sessionUser(req);
-    if (!u) return send(res, 401, { error: 'Authentication required' });
-    const url = new URL(req.url, 'http://localhost');
-    const page = Math.max(1, Number.parseInt(url.searchParams.get('page') || '1', 10) || 1);
-    const limit = Math.min(100, Math.max(1, Number.parseInt(url.searchParams.get('limit') || '50', 10) || 50));
-    const search = String(url.searchParams.get('search') || '').trim().toLowerCase().slice(0, 100);
-    const d = await userData(u.userId);
-    const customers = Array.isArray(d.customers) ? d.customers : [];
-    const loans = Array.isArray(d.loans) ? d.loans : [];
-    const expired = Array.isArray(d.expiredCustomers) ? d.expiredCustomers : [];
-    const customerById = new Map(customers.map(c => [String(c.id), c]));
-    const loansByCustomer = new Map();
-    for (const l of loans) { const cid=String(l.customerId||''); if(!loansByCustomer.has(cid)) loansByCustomer.set(cid,[]); loansByCustomer.get(cid).push(l); }
-    const rows = expired.map(ex => {
-      const cid=String(ex.customerId || ex.id || ''), customer=customerById.get(cid); if(!customer)return null;
-      const hay=[customer.id,customer.firstName,customer.middleName,customer.lastName,customer.name,customer.mobile,customer.city].join(' ').toLowerCase();
-      if(search && !hay.includes(search))return null;
-      const customerLoans=loansByCustomer.get(cid)||[];
-      return { expired:ex, customer, loanCount:customerLoans.length, outstanding:customerLoans.reduce((sum,l)=>sum+Math.max(0,Number(l.amount||0)),0) };
-    }).filter(Boolean);
-    rows.sort((a,b)=>String(b.expired.date||'').localeCompare(String(a.expired.date||'')));
-    const total=rows.length,totalPages=Math.max(1,Math.ceil(total/limit)),safePage=Math.min(page,totalPages),start=(safePage-1)*limit;
-    return send(res,200,{rows:rows.slice(start,start+limit),pagination:{page:safePage,limit,total,totalPages,hasNext:safePage<totalPages,hasPrevious:safePage>1},user:u});
+  // Loan reads are backed directly by normalized PostgreSQL.
+  if (method === 'GET' && parts[1] === 'loans' && parts[2]) {
+    const u=await sessionUser(req); if(!u)return send(res,401,{error:'Authentication required'});
+    const loanId=decodeURIComponent(parts[2]);
+    const lr=await db.query(`SELECT l.id,l.customer_id,l.data_json AS loan_json FROM loans l WHERE l.id=$1 OR l.data_json->>'id'=$1 LIMIT 1`,[loanId]);
+    if(!lr.rows.length)return send(res,404,{error:'Loan not found'});
+    const r=lr.rows[0],loan=rowJson(r.loan_json),actualId=String(r.id);
+    const [cr,pr,sr]=await Promise.all([db.query(`SELECT data_json FROM customers WHERE id=$1 OR data_json->>'id'=$1 LIMIT 1`,[r.customer_id]),db.query(`SELECT data_json FROM payments WHERE loan_id=$1 ORDER BY payment_date DESC NULLS LAST,id DESC`,[actualId]),db.query(`SELECT data_json FROM schedules WHERE loan_id=$1 ORDER BY due_date DESC NULLS LAST,id DESC`,[actualId])]);
+    const payments=pr.rows.map(x=>rowJson(x.data_json)),schedules=sr.rows.map(x=>rowJson(x.data_json));
+    const paidPrincipal=payments.reduce((a,p)=>a+Number(p?.principal||0),0),totalPaid=payments.reduce((a,p)=>a+Number(p?.total||0),0),outstanding=Math.max(0,Number(loan.amount||0)-paidPrincipal),today=isoDateFromQuery(new URL(req.url,'http://localhost').searchParams.get('date'));
+    const next=schedules.filter(s=>Number(s?.emi||0)-Number(s?.paid||0)>0.005&&String(s?.dueDate||'')>=today).sort((a,b)=>String(a.dueDate||'').localeCompare(String(b.dueDate||'')))[0]||null;
+    const overdue=schedules.some(s=>String(s?.dueDate||'')<today&&String(s?.status||'').toUpperCase()!=='PAID'&&Number(s?.emi||0)-Number(s?.paid||0)>0.005);
+    const status=outstanding<=0.005?'CLOSED':String(loan.status||'').toUpperCase()==='DEAD'?'DEAD':overdue?'OVERDUE':'ACTIVE';
+    return send(res,200,{loan,customer:cr.rows[0]?rowJson(cr.rows[0].data_json):null,payments,schedules,summary:{paidPrincipal,totalPaid,outstanding,status,nextDue:next?.dueDate||null},user:u});
   }
 
-  // Targeted schedule search. Data is sourced from normalized PostgreSQL via userData().
-  if (method === 'GET' && parts[1] === 'schedule' && parts[2] === 'search') {
-    const u = await sessionUser(req);
-    if (!u) return send(res,401,{error:'Authentication required'});
-    const url=new URL(req.url,'http://localhost');
-    const q=String(url.searchParams.get('q')||'').trim().toLowerCase().slice(0,100);
-    if(!q) return send(res,200,{loans:[],user:u});
-    const d=await userData(u.userId), customers=Array.isArray(d.customers)?d.customers:[], loans=Array.isArray(d.loans)?d.loans:[];
-    const expiredIds=new Set((d.expiredCustomers||[]).map(x=>String(x.customerId||x.id||'')));
-    const byId=new Map(customers.map(c=>[String(c.id),c]));
-    const rows=loans.filter(l=>!expiredIds.has(String(l.customerId))).map(l=>{const c=byId.get(String(l.customerId))||{};const name=[c.firstName,c.middleName,c.lastName].filter(Boolean).join(' ')||c.name||'';return {loan:l,customer:c,name};}).filter(r=>[r.loan.id,r.loan.customerId,r.loan.khataNo,r.loan.legacyKhataNo,r.name,r.customer.mobile].join(' ').toLowerCase().includes(q)).slice(0,20);
-    return send(res,200,{loans:rows,user:u});
+  if (method === 'GET' && parts[1] === 'loans' && !parts[2]) {
+    const u=await sessionUser(req); if(!u)return send(res,401,{error:'Authentication required'});
+    const url=new URL(req.url,'http://localhost'); const page=Math.max(1,Number.parseInt(url.searchParams.get('page')||'1',10)||1); const limit=Math.min(100,Math.max(1,Number.parseInt(url.searchParams.get('limit')||'50',10)||50)); const search=String(url.searchParams.get('search')||'').trim().toLowerCase().slice(0,100); const statusFilter=String(url.searchParams.get('status')||'').trim().toUpperCase(); const sort=String(url.searchParams.get('sort')||'startDate'); const order=String(url.searchParams.get('order')||'desc').toLowerCase()==='asc'?'ASC':'DESC'; const today=isoDateFromQuery(url.searchParams.get('date')); const q=`%${search.replace(/[%_\\]/g,'\\$&')}%`;
+    const base=`WITH paid AS (SELECT loan_id,COALESCE(SUM(principal),0)::numeric paid_principal FROM payments GROUP BY loan_id),base AS (SELECT l.data_json loan_json,l.id loan_id,l.customer_id,l.khata_no,l.amount,l.start_date,c.data_json customer_json,COALESCE(p.paid_principal,0)::numeric paid_principal,GREATEST(0,l.amount-COALESCE(p.paid_principal,0))::numeric remaining,COALESCE(NULLIF(TRIM(CONCAT_WS(' ',c.first_name,c.middle_name,c.last_name)),''),c.name,c.id) customer_name,CASE WHEN GREATEST(0,l.amount-COALESCE(p.paid_principal,0))<=0.005 THEN 'COMPLETED' WHEN UPPER(COALESCE(l.status,''))='DEAD' THEN 'DEAD' WHEN EXISTS(SELECT 1 FROM schedules s WHERE s.loan_id=l.id AND s.due_date<$6::date AND UPPER(COALESCE(s.status,''))<>'PAID' AND GREATEST(0,s.emi-s.paid)>0.005) THEN 'OVERDUE' ELSE 'ACTIVE' END computed_status FROM loans l JOIN customers c ON c.id=l.customer_id LEFT JOIN paid p ON p.loan_id=l.id WHERE NOT EXISTS(SELECT 1 FROM expired_customers e WHERE e.customer_id=l.customer_id)),filtered AS (SELECT * FROM base WHERE ($1='' OR loan_id ILIKE $2 ESCAPE '\\' OR COALESCE(khata_no,'') ILIKE $2 ESCAPE '\\' OR COALESCE(customer_name,'') ILIKE $2 ESCAPE '\\' OR COALESCE(customer_json->>'mobile','') ILIKE $2 ESCAPE '\\' OR customer_id ILIKE $2 ESCAPE '\\' OR computed_status ILIKE $2 ESCAPE '\\') AND ($3='' OR computed_status=$3))`;
+    const sortMap={id:'loan_id',khataNo:'khata_no',startDate:'start_date',amount:'amount',remaining:'remaining',status:'computed_status',customer:'customer_name'}; const sortExpr=sortMap[sort]||'start_date'; const countParams=[search,q,statusFilter,null,null,today];
+    const countR=await db.query(`${base} SELECT COUNT(*)::int total FROM filtered`,countParams); const total=Number(countR.rows[0]?.total||0); const totalPages=Math.max(1,Math.ceil(total/limit)); const safePage=Math.min(page,totalPages);
+    const rr=await db.query(`${base} SELECT loan_json,customer_json,remaining,computed_status FROM filtered ORDER BY ${sortExpr} ${order},loan_id DESC LIMIT $7 OFFSET $8`,[search,q,statusFilter,null,null,today,limit,(safePage-1)*limit]);
+    const loans=rr.rows.map(r=>{const l=rowJson(r.loan_json);l.remaining=Number(r.remaining||0);l.computedStatus=String(r.computed_status||'ACTIVE');l.customer=rowJson(r.customer_json);return l;});
+    return send(res,200,{loans,pagination:{page:safePage,limit,total,totalPages,hasNext:safePage<totalPages,hasPrevious:safePage>1},user:u});
   }
 
-  // Server-side report/analytics aggregation. The browser receives only the
-  // selected year's 12 monthly rows and KPI values instead of all payments.
   if (method === 'GET' && (parts[1] === 'reports' || parts[1] === 'analytics') && !parts[2]) {
     const u=await sessionUser(req); if(!u)return send(res,401,{error:'Authentication required'});
     const url=new URL(req.url,'http://localhost');

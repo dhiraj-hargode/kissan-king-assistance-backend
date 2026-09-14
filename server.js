@@ -108,7 +108,14 @@ function positive(v) {
 }
 
 function integrity(data) {
+  // Keep validation linear in the size of the dataset. The previous implementation
+  // repeatedly scanned customers/payments/schedules for every record, which became
+  // very expensive with 1,000 customers, 6,520 loans and 29,000+ payments.
   const e = [], cs = new Set(), ls = new Set(), kh = new Set();
+  const customerMobiles = new Map();
+  const loanMap = new Map();
+  const scheduleMap = new Map();
+  const principalByLoan = new Map();
 
   for (const c of data.customers) {
     const id = String(c.id);
@@ -116,20 +123,21 @@ function integrity(data) {
     cs.add(id);
     if (!String(c.firstName || '').trim()) e.push('Customer ' + id + ' has no first name');
     if (!mobileOk(c.mobile, true)) e.push('Customer ' + id + ' has invalid mobile');
-    if (!String(c.city || '').trim()) {
-      e.push('Customer ' + id + ' has no city');
-    }
+    if (!String(c.city || '').trim()) e.push('Customer ' + id + ' has no city');
     if (!String(c.district || '').trim()) e.push('Customer ' + id + ' has no district');
     const m = String(c.mobile || '');
-    if ([...data.customers].filter(x => String(x.mobile || '') === m).length > 1) {
-      e.push('Duplicate customer mobile: ' + m);
-    }
+    customerMobiles.set(m, (customerMobiles.get(m) || 0) + 1);
+  }
+
+  for (const [mobile, count] of customerMobiles) {
+    if (count > 1) e.push('Duplicate customer mobile: ' + mobile);
   }
 
   for (const l of data.loans) {
     const id = String(l.id);
     if (ls.has(id)) e.push('Duplicate loan ID: ' + id);
     ls.add(id);
+    loanMap.set(id, l);
     if (!cs.has(String(l.customerId))) e.push('Loan ' + id + ' references missing customer');
     if (!positive(l.amount)) e.push('Loan ' + id + ' has invalid amount');
     if (!validDate(l.startDate)) e.push('Loan ' + id + ' has invalid start date');
@@ -140,43 +148,51 @@ function integrity(data) {
   }
 
   for (const s of data.schedules) {
-    if (!ls.has(String(s.loanId))) e.push('Schedule ' + s.id + ' references missing loan');
-    if (!validDate(s.dueDate)) e.push('Schedule ' + s.id + ' has invalid due date');
+    const id = String(s.id);
+    scheduleMap.set(id, s);
+    if (!ls.has(String(s.loanId))) e.push('Schedule ' + id + ' references missing loan');
+    if (!validDate(s.dueDate)) e.push('Schedule ' + id + ' has invalid due date');
+  }
+
+  // First pass: aggregate principal by loan in O(payments).
+  for (const p of data.payments) {
+    const loanId = String(p.loanId);
+    const principal = Number(p.principal || 0);
+    principalByLoan.set(loanId, (principalByLoan.get(loanId) || 0) + principal);
   }
 
   for (const p of data.payments) {
-    if (!ls.has(String(p.loanId))) e.push('Payment ' + p.id + ' references missing loan');
-    if (!validDate(p.date)) e.push('Payment ' + p.id + ' has invalid date');
-
-    const loan = data.loans.find(x => String(x.id) === String(p.loanId));
+    const id = String(p.id);
+    const loanId = String(p.loanId);
+    const loan = loanMap.get(loanId);
+    if (!loan) e.push('Payment ' + id + ' references missing loan');
+    if (!validDate(p.date)) e.push('Payment ' + id + ' has invalid date');
     if (loan && validDate(loan.startDate) && validDate(p.date) && p.date < loan.startDate) {
-      e.push('Payment ' + p.id + ' is before loan start date');
+      e.push('Payment ' + id + ' is before loan start date');
     }
 
     const principal = Number(p.principal || 0);
     const interest = Number(p.interest || 0);
     const penalty = Number(p.penalty || 0);
     const t = principal + interest + penalty;
-
     if (![principal, interest, penalty, t].every(Number.isFinite) || principal < 0 || interest < 0 || penalty < 0) {
-      e.push('Payment ' + p.id + ' has invalid amounts');
+      e.push('Payment ' + id + ' has invalid amounts');
     }
-
-    if (Math.abs(t - Number(p.total || 0)) > 0.01) e.push('Payment ' + p.id + ' total mismatch');
+    if (Math.abs(t - Number(p.total || 0)) > 0.01) e.push('Payment ' + id + ' total mismatch');
 
     if (loan) {
-      const other = data.payments
-        .filter(x => String(x.loanId) === String(loan.id) && String(x.id) !== String(p.id))
-        .reduce((sum, x) => sum + Number(x.principal || 0), 0);
-      if (other + principal > Number(loan.amount) + 0.01) {
-        e.push('Payment ' + p.id + ' exceeds loan principal');
+      // The aggregate includes this payment; compare the complete principal sum once.
+      // The per-payment error message is retained for compatibility.
+      const totalPrincipal = principalByLoan.get(loanId) || 0;
+      if (totalPrincipal > Number(loan.amount) + 0.01) {
+        e.push('Payment ' + id + ' exceeds loan principal');
       }
     }
 
     if (p.scheduleId) {
-      const sc = data.schedules.find(x => String(x.id) === String(p.scheduleId));
-      if (!sc) e.push('Payment ' + p.id + ' references missing schedule');
-      else if (String(sc.loanId) !== String(p.loanId)) e.push('Payment ' + p.id + ' schedule does not belong to loan');
+      const sc = scheduleMap.get(String(p.scheduleId));
+      if (!sc) e.push('Payment ' + id + ' references missing schedule');
+      else if (String(sc.loanId) !== loanId) e.push('Payment ' + id + ' schedule does not belong to loan');
     }
   }
 

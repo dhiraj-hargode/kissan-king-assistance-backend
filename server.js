@@ -244,10 +244,10 @@ async function initDb() {
   `);
 
   await db.query(`
-    CREATE TABLE IF NOT EXISTS user_data (
-      user_id TEXT PRIMARY KEY,
-      data_json JSONB NOT NULL,
-      updated_at TIMESTAMPTZ NOT NULL
+    CREATE TABLE IF NOT EXISTS app_settings (
+      id TEXT PRIMARY KEY,
+      settings JSONB NOT NULL DEFAULT '{}'::jsonb,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `);
 
@@ -355,86 +355,38 @@ async function initDb() {
   await db.query('CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id)');
   await db.query('CREATE INDEX IF NOT EXISTS idx_users_username ON users(username)');
 
-  const metaResult = await db.query(
-    'SELECT value FROM app_meta WHERE key = $1',
-    ['shared_data_v1']
-  );
+  // Normalized PostgreSQL is the only business-data source of truth.
+  // Migrate application settings from the old user_data table once, if it
+  // still exists, then remove the obsolete table. Never read business data
+  // from the legacy JSON document again.
+  const legacyTable = await db.query(`
+    SELECT to_regclass('public.user_data') IS NOT NULL AS exists
+  `);
+  if (legacyTable.rows[0]?.exists) {
+    await db.query(`
+      INSERT INTO app_settings(id, settings, updated_at)
+      SELECT $1, COALESCE(data_json->'settings', '{}'::jsonb), COALESCE(updated_at, NOW())
+      FROM user_data
+      WHERE user_id = $1
+      ON CONFLICT (id) DO UPDATE
+      SET settings = EXCLUDED.settings, updated_at = EXCLUDED.updated_at
+    `, [SHARED_DATA_ID]);
 
-  const sharedResult = await db.query(
-    'SELECT data_json FROM user_data WHERE user_id = $1',
-    [SHARED_DATA_ID]
-  );
-
-  if (!metaResult.rows.length) {
-    const rows = await db.query(
-      'SELECT data_json FROM user_data WHERE user_id <> $1',
-      [SHARED_DATA_ID]
+    const normalizedMarker = await db.query(
+      'SELECT 1 FROM app_meta WHERE key = $1',
+      ['normalized_data_v1']
     );
-
-    const merged = mergeDataSets(rows.rows.map(r => {
-      try {
-        return typeof r.data_json === 'string' ? JSON.parse(r.data_json) : r.data_json;
-      } catch {
-        return blankData();
-      }
-    }));
-
-    await db.query(
-      `INSERT INTO user_data(user_id, data_json, updated_at)
-       VALUES ($1, $2::jsonb, $3)
-       ON CONFLICT (user_id) DO UPDATE
-       SET data_json = EXCLUDED.data_json,
-           updated_at = EXCLUDED.updated_at`,
-      [SHARED_DATA_ID, JSON.stringify(merged), now()]
-    );
-
-    await db.query(
-      `INSERT INTO app_meta(key, value)
-       VALUES ($1, $2)
-       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
-      ['shared_data_v1', now()]
-    );
-  } else if (!sharedResult.rows.length) {
-    const d = blankData();
-    await db.query(
-      `INSERT INTO user_data(user_id, data_json, updated_at)
-       VALUES ($1, $2::jsonb, $3)`,
-      [SHARED_DATA_ID, JSON.stringify(d), now()]
-    );
+    if (normalizedMarker.rows.length) {
+      await db.query('DROP TABLE IF EXISTS user_data');
+      console.log('Legacy user_data table removed; normalized PostgreSQL retained.');
+    }
   }
 
-  // Once normalized PostgreSQL is active, the monolithic legacy JSON snapshot
-  // is no longer the business-data source of truth. Keep only application
-  // settings in the shared user_data row and remove any obsolete per-user
-  // business-data snapshots. The normalized tables remain untouched.
-  const normalizedMarker = await db.query(
-    'SELECT 1 FROM app_meta WHERE key = $1',
-    ['normalized_data_v1']
-  );
-  if (normalizedMarker.rows.length) {
-    const before = await db.query(
-      `SELECT COALESCE(SUM(pg_column_size(data_json)), 0)::bigint AS bytes, COUNT(*)::int AS rows
-       FROM user_data`
-    );
-    await db.query(
-      `UPDATE user_data
-       SET data_json = jsonb_build_object('settings', COALESCE(data_json->'settings', '{}'::jsonb)),
-           updated_at = $2
-       WHERE user_id = $1`,
-      [SHARED_DATA_ID, now()]
-    );
-    await db.query(
-      'DELETE FROM user_data WHERE user_id <> $1',
-      [SHARED_DATA_ID]
-    );
-    const after = await db.query(
-      `SELECT COALESCE(SUM(pg_column_size(data_json)), 0)::bigint AS bytes, COUNT(*)::int AS rows
-       FROM user_data`
-    );
-    console.log(
-      `Legacy JSON mirror compacted: ${before.rows[0]?.bytes || 0} bytes/${before.rows[0]?.rows || 0} rows -> ${after.rows[0]?.bytes || 0} bytes/${after.rows[0]?.rows || 0} row (normalized PostgreSQL retained).`
-    );
-  }
+  await db.query(`
+    INSERT INTO app_settings(id, settings, updated_at)
+    VALUES ($1, '{}'::jsonb, NOW())
+    ON CONFLICT (id) DO NOTHING
+  `, [SHARED_DATA_ID]);
 
   console.log('PostgreSQL schema initialized successfully.');
 }
@@ -495,14 +447,6 @@ async function userById(id) {
   return result.rows[0] || null;
 }
 
-async function dataByShared() {
-  const result = await db.query(
-    'SELECT data_json FROM user_data WHERE user_id = $1',
-    [SHARED_DATA_ID]
-  );
-  return result.rows[0] || null;
-}
-
 async function countUsers() {
   const result = await db.query('SELECT COUNT(*)::int AS c FROM users');
   return Number(result.rows[0].c);
@@ -526,7 +470,7 @@ async function loadNormalizedData(executor = db) {
     executor.query('SELECT data_json FROM notifications ORDER BY created_at DESC NULLS LAST, id DESC'),
     executor.query('SELECT data_json FROM deleted_records ORDER BY deleted_at DESC NULLS LAST, id DESC'),
     executor.query('SELECT data_json FROM expired_customers ORDER BY expired_date DESC NULLS LAST, id DESC'),
-    executor.query(`SELECT COALESCE(data_json->'settings', '{}'::jsonb) AS settings FROM user_data WHERE user_id = $1`, [SHARED_DATA_ID])
+    executor.query(`SELECT COALESCE(settings, '{}'::jsonb) AS settings FROM app_settings WHERE id = $1`, [SHARED_DATA_ID])
   ]);
 
   const schedules = schedulesR.rows.map(r => {
@@ -850,22 +794,8 @@ async function syncNormalizedOperations(client, data, operations) {
   }
 }
 
-async function userData() {
-  const meta = await db.query('SELECT 1 FROM app_meta WHERE key = $1', ['normalized_data_v1']);
-  if (meta.rows.length) return loadNormalizedData();
-
-  const r = await dataByShared();
-  if (!r) {
-    const d = blankData();
-    await db.query(
-      `INSERT INTO user_data(user_id, data_json, updated_at)
-       VALUES ($1, $2::jsonb, $3)
-       ON CONFLICT (user_id) DO NOTHING`,
-      [SHARED_DATA_ID, JSON.stringify(d), now()]
-    );
-    return d;
-  }
-  return normalizeData(rowJson(r.data_json));
+async function userData(executor = db) {
+  return loadNormalizedData(executor);
 }
 
 async function saveData(data) {
@@ -874,13 +804,11 @@ async function saveData(data) {
   try {
     await client.query('BEGIN');
     await syncNormalizedFull(client, normalized);
-    // Keep user_data as a tiny compatibility/settings row only. Business data
-    // is stored in normalized PostgreSQL tables.
     await client.query(
-      `INSERT INTO user_data(user_id, data_json, updated_at)
-       VALUES ($1, jsonb_build_object('settings', $2::jsonb), $3)
-       ON CONFLICT (user_id) DO UPDATE
-       SET data_json = jsonb_build_object('settings', $2::jsonb), updated_at = EXCLUDED.updated_at`,
+      `INSERT INTO app_settings(id, settings, updated_at)
+       VALUES ($1, $2::jsonb, $3)
+       ON CONFLICT (id) DO UPDATE
+       SET settings = EXCLUDED.settings, updated_at = EXCLUDED.updated_at`,
       [SHARED_DATA_ID, JSON.stringify(normalized.settings || blankData().settings), now()]
     );
     await client.query(
@@ -1632,178 +1560,20 @@ async function normalizedMigrationStatus() {
       (SELECT COUNT(*)::int FROM notifications) AS notifications,
       (SELECT COUNT(*)::int FROM expired_customers) AS expired_customers
   `);
-  return { source: meta.rows[0] ? 'normalized_postgresql' : 'legacy_jsonb', legacyMirror: true, migratedAt: meta.rows[0]?.value || null, counts: counts.rows[0] || {} };
+  return { source: meta.rows[0] ? 'normalized_postgresql' : 'not_migrated', legacyMirror: false, migratedAt: meta.rows[0]?.value || null, counts: counts.rows[0] || {} };
 }
 
 async function migrateJsonToNormalized() {
-  const source = await userData();
-  const issues = integrity(source);
-  if (issues.length) {
-    const error = new Error(`Source data has ${issues.length} integrity issue(s). Fix/validate the data before migration.`);
-    error.details = issues.slice(0, 20);
-    throw error;
+  const status = await normalizedMigrationStatus();
+  if (status.source === 'normalized_postgresql') {
+    return {
+      alreadyMigrated: true,
+      message: 'Normalized PostgreSQL is already active. No migration was performed.',
+      counts: status.counts,
+      migratedAt: status.migratedAt
+    };
   }
-
-  const client = await db.connect();
-  try {
-    await client.query('BEGIN');
-    // Shadow migration: replace normalized tables atomically. The JSONB source is untouched.
-    await client.query('TRUNCATE TABLE payments, schedules, blacklist, notifications, deleted_records, expired_customers, loans, customers CASCADE');
-
-    // IMPORTANT: application JSON uses camelCase field names (customerId, loanId,
-    // createdAt, interestRate, etc.).  The normalized SQL schema uses snake_case.
-    // Read both camelCase and snake_case so older backups remain compatible.
-    const j = JSON.stringify;
-
-    await client.query(`
-      INSERT INTO customers
-        (id, first_name, middle_name, last_name, name, mobile, alternate_mobile, reference, address, city, district, pincode, status, created_at, updated_at, data_json)
-      SELECT
-        src.raw->>'id',
-        COALESCE(NULLIF(src.raw->>'firstName',''), NULLIF(src.raw->>'first_name','')),
-        COALESCE(NULLIF(src.raw->>'middleName',''), NULLIF(src.raw->>'middle_name','')),
-        COALESCE(NULLIF(src.raw->>'lastName',''), NULLIF(src.raw->>'last_name','')),
-        src.raw->>'name',
-        COALESCE(NULLIF(src.raw->>'mobile',''), NULLIF(src.raw->>'phone','')),
-        COALESCE(NULLIF(src.raw->>'alternateMobile',''), NULLIF(src.raw->>'alternate_mobile','')),
-        COALESCE(NULLIF(src.raw->>'reference',''), NULLIF(src.raw->>'customerReference','')),
-        src.raw->>'address', src.raw->>'city', src.raw->>'district', src.raw->>'pincode', src.raw->>'status',
-        NULLIF(COALESCE(src.raw->>'createdAt', src.raw->>'created_at'),'')::timestamptz,
-        NULLIF(COALESCE(src.raw->>'updatedAt', src.raw->>'updated_at'),'')::timestamptz,
-        src.raw
-      FROM jsonb_array_elements($1::jsonb) AS src(raw)
-      WHERE NULLIF(src.raw->>'id','') IS NOT NULL
-    `, [j(source.customers)]);
-
-    await client.query(`
-      INSERT INTO loans
-        (id, customer_id, khata_no, loan_type, loan_against, amount, rate, emi, emi_option, start_date, status, created_at, updated_at, data_json)
-      SELECT
-        src.raw->>'id',
-        COALESCE(NULLIF(src.raw->>'customerId',''), NULLIF(src.raw->>'customer_id','')),
-        COALESCE(NULLIF(src.raw->>'khataNo',''), NULLIF(src.raw->>'khata_no',''), NULLIF(src.raw->>'legacyKhataNo',''), NULLIF(src.raw->>'legacy_khata_no','')),
-        COALESCE(NULLIF(src.raw->>'loanType',''), NULLIF(src.raw->>'loan_type','')),
-        COALESCE(NULLIF(src.raw->>'loanAgainst',''), NULLIF(src.raw->>'loan_against','')),
-        COALESCE(NULLIF(src.raw->>'amount','')::numeric, 0),
-        COALESCE(NULLIF(src.raw->>'interestRate','')::numeric, NULLIF(src.raw->>'rate','')::numeric, 0),
-        COALESCE(NULLIF(src.raw->>'emi','')::numeric, 0),
-        COALESCE(NULLIF(src.raw->>'emiOption',''), NULLIF(src.raw->>'emi_option','')),
-        NULLIF(COALESCE(src.raw->>'startDate', src.raw->>'start_date'),'')::date,
-        src.raw->>'status',
-        NULLIF(COALESCE(src.raw->>'createdAt', src.raw->>'created_at'),'')::timestamptz,
-        NULLIF(COALESCE(src.raw->>'updatedAt', src.raw->>'updated_at'),'')::timestamptz,
-        src.raw
-      FROM jsonb_array_elements($1::jsonb) AS src(raw)
-      WHERE NULLIF(src.raw->>'id','') IS NOT NULL
-    `, [j(source.loans)]);
-
-    await client.query(`
-      INSERT INTO schedules
-        (id, loan_id, due_date, installment_no, emi, principal, interest, penalty, paid, remaining, status, manual_pending, pending_added_at, pending_added_by, data_json)
-      SELECT
-        src.raw->>'id',
-        COALESCE(NULLIF(src.raw->>'loanId',''), NULLIF(src.raw->>'loan_id','')),
-        NULLIF(COALESCE(src.raw->>'dueDate', src.raw->>'due_date'),'')::date,
-        COALESCE(NULLIF(src.raw->>'installment','')::int, NULLIF(src.raw->>'installmentNo','')::int, NULLIF(src.raw->>'installment_no','')::int),
-        COALESCE(NULLIF(src.raw->>'emi','')::numeric, 0),
-        COALESCE(NULLIF(src.raw->>'principal','')::numeric, 0),
-        COALESCE(NULLIF(src.raw->>'interest','')::numeric, 0),
-        COALESCE(NULLIF(src.raw->>'penalty','')::numeric, 0),
-        COALESCE(NULLIF(src.raw->>'paid','')::numeric, 0),
-        COALESCE(NULLIF(src.raw->>'remaining','')::numeric, 0),
-        src.raw->>'status',
-        COALESCE(NULLIF(src.raw->>'manualPending','')::boolean, NULLIF(src.raw->>'manual_pending','')::boolean, false),
-        NULLIF(COALESCE(src.raw->>'pendingAddedAt', src.raw->>'pending_added_at'),'')::timestamptz,
-        COALESCE(NULLIF(src.raw->>'pendingAddedBy',''), NULLIF(src.raw->>'pending_added_by','')),
-        src.raw
-      FROM jsonb_array_elements($1::jsonb) AS src(raw)
-      WHERE NULLIF(src.raw->>'id','') IS NOT NULL
-    `, [j(source.schedules)]);
-
-    await client.query(`
-      INSERT INTO payments
-        (id, loan_id, schedule_id, payment_date, principal, interest, penalty, total, mode, notes, created_at, activity_created_at, data_json)
-      SELECT
-        src.raw->>'id',
-        COALESCE(NULLIF(src.raw->>'loanId',''), NULLIF(src.raw->>'loan_id','')),
-        NULLIF(COALESCE(src.raw->>'scheduleId', src.raw->>'schedule_id'),'') ,
-        NULLIF(COALESCE(src.raw->>'date', src.raw->>'paymentDate', src.raw->>'payment_date'),'')::date,
-        COALESCE(NULLIF(src.raw->>'principal','')::numeric, 0),
-        COALESCE(NULLIF(src.raw->>'interest','')::numeric, 0),
-        COALESCE(NULLIF(src.raw->>'penalty','')::numeric, 0),
-        COALESCE(NULLIF(src.raw->>'total','')::numeric, 0),
-        src.raw->>'mode', src.raw->>'notes',
-        NULLIF(COALESCE(src.raw->>'createdAt', src.raw->>'created_at'),'')::timestamptz,
-        NULLIF(COALESCE(src.raw->>'activityCreatedAt', src.raw->>'activity_created_at'),'')::timestamptz,
-        src.raw
-      FROM jsonb_array_elements($1::jsonb) AS src(raw)
-      WHERE NULLIF(src.raw->>'id','') IS NOT NULL
-    `, [j(source.payments)]);
-
-    await client.query(`
-      INSERT INTO blacklist (id, customer_id, reason, blacklist_date, notes, outstanding, created_at, data_json)
-      SELECT
-        src.raw->>'id',
-        COALESCE(NULLIF(src.raw->>'customerId',''), NULLIF(src.raw->>'customer_id','')),
-        src.raw->>'reason',
-        NULLIF(COALESCE(src.raw->>'date', src.raw->>'blacklistDate', src.raw->>'blacklist_date'),'')::date,
-        src.raw->>'notes', COALESCE(NULLIF(src.raw->>'outstanding','')::numeric,0),
-        NULLIF(COALESCE(src.raw->>'createdAt', src.raw->>'created_at'),'')::timestamptz,
-        src.raw
-      FROM jsonb_array_elements($1::jsonb) AS src(raw)
-      WHERE NULLIF(src.raw->>'id','') IS NOT NULL
-    `, [j(source.blacklist)]);
-
-    await client.query(`
-      INSERT INTO notifications (id, customer_id, type, title, message, read, created_at, data_json)
-      SELECT
-        src.raw->>'id',
-        NULLIF(COALESCE(src.raw->>'customerId', src.raw->>'customer_id'),'') ,
-        src.raw->>'type', src.raw->>'title', src.raw->>'message',
-        COALESCE(NULLIF(src.raw->>'read','')::boolean, false),
-        NULLIF(COALESCE(src.raw->>'createdAt', src.raw->>'created_at'),'')::timestamptz,
-        src.raw
-      FROM jsonb_array_elements($1::jsonb) AS src(raw)
-      WHERE NULLIF(src.raw->>'id','') IS NOT NULL
-    `, [j(source.notifications)]);
-
-    await client.query(`
-      INSERT INTO deleted_records (id, record_type, record_id, deleted_at, deleted_by, data_json)
-      SELECT
-        src.raw->>'id',
-        COALESCE(NULLIF(src.raw->>'recordType',''), NULLIF(src.raw->>'record_type','')),
-        COALESCE(NULLIF(src.raw->>'recordId',''), NULLIF(src.raw->>'record_id','')),
-        NULLIF(COALESCE(src.raw->>'deletedAt', src.raw->>'deleted_at'),'')::timestamptz,
-        COALESCE(NULLIF(src.raw->>'deletedBy',''), NULLIF(src.raw->>'deleted_by','')),
-        src.raw
-      FROM jsonb_array_elements($1::jsonb) AS src(raw)
-      WHERE NULLIF(src.raw->>'id','') IS NOT NULL
-    `, [j(source.deletedRecords)]);
-
-    await client.query(`
-      INSERT INTO expired_customers (id, customer_id, reason, expired_date, notes, data_json)
-      SELECT
-        src.raw->>'id',
-        COALESCE(NULLIF(src.raw->>'customerId',''), NULLIF(src.raw->>'customer_id','')),
-        COALESCE(NULLIF(src.raw->>'reason',''), NULLIF(src.raw->>'status','')),
-        NULLIF(COALESCE(src.raw->>'date', src.raw->>'expiredDate', src.raw->>'expired_date'),'')::date,
-        src.raw->>'notes', src.raw
-      FROM jsonb_array_elements($1::jsonb) AS src(raw)
-      WHERE NULLIF(src.raw->>'id','') IS NOT NULL
-    `, [j(source.expiredCustomers)]);
-
-    await client.query(
-      `INSERT INTO app_meta(key, value) VALUES ($1,$2) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value`,
-      ['normalized_data_v1', now()]
-    );
-    await client.query('COMMIT');
-    return await normalizedMigrationStatus();
-  } catch (e) {
-    try { await client.query('ROLLBACK'); } catch {}
-    throw e;
-  } finally {
-    client.release();
-  }
+  throw new Error('Legacy JSON migration is no longer available because the legacy user_data table has been retired. Restore a pre-migration backup before attempting a legacy migration.');
 }
 
 async function api(req, res) {
@@ -1823,8 +1593,8 @@ async function api(req, res) {
 
   if (method === 'GET' && parts[1] === 'public' && parts[2] === 'branding') {
     const r = await db.query(`
-      SELECT COALESCE(data_json->'settings', '{}'::jsonb) AS settings
-      FROM user_data WHERE user_id = $1`, [SHARED_DATA_ID]);
+      SELECT COALESCE(settings, '{}'::jsonb) AS settings
+      FROM app_settings WHERE id = $1`, [SHARED_DATA_ID]);
     const settings = r.rows[0]?.settings || {};
     return send(res, 200, {
       branding: {
@@ -2036,7 +1806,7 @@ async function api(req, res) {
     });
   }
 
-  // Targeted collections read APIs. Data is sourced from normalized PostgreSQL via userData().
+  // Targeted collections read APIs. Data is sourced from normalized PostgreSQL.
   if (method === 'GET' && parts[1] === 'collections' && parts[2] === 'today') {
     const u = await sessionUser(req);
     if (!u) return send(res, 401, { error: 'Authentication required' });
@@ -2276,7 +2046,7 @@ async function api(req, res) {
     });
   }
 
-  // Loan reads are backed by normalized PostgreSQL via userData().
+  // Loan reads are backed by normalized PostgreSQL.
   if (method === 'GET' && parts[1] === 'loans' && parts[2]) {
     const u = await sessionUser(req);
     if (!u) return send(res, 401, { error: 'Authentication required' });
@@ -2407,7 +2177,7 @@ async function api(req, res) {
     return send(res,200,{rows:rows.slice(start,start+limit),pagination:{page:safePage,limit,total,totalPages,hasNext:safePage<totalPages,hasPrevious:safePage>1},user:u});
   }
 
-  // Blacklist reads are backed by normalized PostgreSQL via userData().
+  // Blacklist reads are backed by normalized PostgreSQL.
   if (method === 'GET' && parts[1] === 'blacklist' && !parts[2]) {
     const u = await sessionUser(req);
     if (!u) return send(res, 401, { error: 'Authentication required' });
@@ -2466,7 +2236,7 @@ async function api(req, res) {
     return send(res,200,{rows:rows.slice(start,start+limit),pagination:{page:safePage,limit,total,totalPages,hasNext:safePage<totalPages,hasPrevious:safePage>1},user:u});
   }
 
-  // Targeted schedule search. Data is sourced from normalized PostgreSQL via userData().
+  // Targeted schedule search. Data is sourced from normalized PostgreSQL.
   if (method === 'GET' && parts[1] === 'schedule' && parts[2] === 'search') {
     const u = await sessionUser(req);
     if (!u) return send(res,401,{error:'Authentication required'});
@@ -2692,13 +2462,6 @@ async function api(req, res) {
         [id, name, username, mobile || null, role, hashPassword(password), now()]
       );
 
-      await db.query(
-        `INSERT INTO user_data(user_id, data_json, updated_at)
-         VALUES ($1, $2::jsonb, $3)
-         ON CONFLICT (user_id) DO NOTHING`,
-        [id, JSON.stringify(blankData()), now()]
-      );
-
       return send(res, 201, { user: { id, name, username, mobile, role } });
     }
 
@@ -2765,7 +2528,7 @@ async function api(req, res) {
     if (b.confirm !== 'MIGRATE') return send(res, 400, { error: 'Type MIGRATE to confirm normalized database migration.' });
     try {
       const result = await migrateJsonToNormalized();
-      return send(res, 200, { ok: true, ...result, source: 'user_data JSONB preserved' });
+      return send(res, 200, { ok: true, ...result, source: 'normalized_postgresql' });
     } catch (e) {
       console.error('Normalized migration failed:', e);
       return send(res, 400, { error: e.message || 'Normalized migration failed', details: e.details || [] });
@@ -2782,38 +2545,21 @@ async function api(req, res) {
     const client = await db.connect();
     try {
       await client.query('BEGIN');
-      const result = await client.query(
-        'SELECT data_json FROM user_data WHERE user_id = $1 FOR UPDATE',
-        [SHARED_DATA_ID]
-      );
-      const before = result.rows[0]
-        ? normalizeData(typeof result.rows[0].data_json === 'string' ? JSON.parse(result.rows[0].data_json) : result.rows[0].data_json)
-        : blankData();
-
-      const counts = {
-        customers: before.customers.length,
-        loans: before.loans.length,
-        schedules: before.schedules.length,
-        payments: before.payments.length,
-        blacklist: before.blacklist.length,
-        notifications: before.notifications.length,
-        deletedRecords: before.deletedRecords.length,
-        expiredCustomers: before.expiredCustomers.length,
-        pendingQueue: before.pendingQueue.length
-      };
-
-      const cleared = blankData();
-      // Preserve application configuration/logo while clearing business records.
-      cleared.settings = { ...before.settings };
-
-      await client.query(
-        `INSERT INTO user_data(user_id, data_json, updated_at)
-         VALUES ($1, $2::jsonb, $3)
-         ON CONFLICT (user_id) DO UPDATE
-         SET data_json = EXCLUDED.data_json, updated_at = EXCLUDED.updated_at`,
-        [SHARED_DATA_ID, JSON.stringify(cleared), now()]
-      );
-
+      await client.query(`SELECT pg_advisory_xact_lock(hashtext('loan-management-shared-data'))`);
+      const countsR = await client.query(`
+        SELECT
+          (SELECT COUNT(*)::int FROM customers) AS customers,
+          (SELECT COUNT(*)::int FROM loans) AS loans,
+          (SELECT COUNT(*)::int FROM schedules) AS schedules,
+          (SELECT COUNT(*)::int FROM payments) AS payments,
+          (SELECT COUNT(*)::int FROM blacklist) AS blacklist,
+          (SELECT COUNT(*)::int FROM notifications) AS notifications,
+          (SELECT COUNT(*)::int FROM deleted_records) AS "deletedRecords",
+          (SELECT COUNT(*)::int FROM expired_customers) AS "expiredCustomers",
+          (SELECT COUNT(*)::int FROM schedules WHERE manual_pending = TRUE) AS "pendingQueue"
+      `);
+      const counts = countsR.rows[0] || {};
+      await client.query('TRUNCATE TABLE payments, schedules, blacklist, notifications, deleted_records, expired_customers, loans, customers CASCADE');
       await client.query('COMMIT');
       return send(res, 200, { ok: true, cleared: counts, preserved: ['settings', 'administrator accounts'] });
     } catch (e) {
@@ -2964,7 +2710,7 @@ async function api(req, res) {
       await client.query('BEGIN');
       // Keep the shared JSON row only as a lightweight mutation lock. The
       // actual business snapshot is now read from normalized PostgreSQL tables.
-      await client.query('SELECT user_id FROM user_data WHERE user_id = $1 FOR UPDATE', [SHARED_DATA_ID]);
+      await client.query(`SELECT pg_advisory_xact_lock(hashtext('loan-management-shared-data'))`);
       const data = await loadNormalizedData(client);
 
       const arrays = new Set(['customers','loans','schedules','payments','blacklist','notifications','deletedRecords','expiredCustomers']);
@@ -3001,18 +2747,13 @@ async function api(req, res) {
       }
 
       const normalized = normalizeData(data);
-      // Phase 3: persist every mutation to the normalized PostgreSQL tables in
-      // the same transaction as the legacy JSON mirror. Single-record changes
-      // use incremental upserts/deletes, avoiding a full-table rewrite on every
-      // payment or schedule update.
+      // Persist every mutation to normalized PostgreSQL tables in this transaction.
       await syncNormalizedOperations(client, normalized, operations);
-      // Keep only settings in the compatibility row; never recreate the old
-      // monolithic business-data JSON document after a mutation.
       await client.query(
-        `INSERT INTO user_data(user_id, data_json, updated_at)
-         VALUES ($1, jsonb_build_object('settings', $2::jsonb), $3)
-         ON CONFLICT (user_id) DO UPDATE
-         SET data_json = jsonb_build_object('settings', $2::jsonb), updated_at = EXCLUDED.updated_at`,
+        `INSERT INTO app_settings(id, settings, updated_at)
+         VALUES ($1, $2::jsonb, $3)
+         ON CONFLICT (id) DO UPDATE
+         SET settings = EXCLUDED.settings, updated_at = EXCLUDED.updated_at`,
         [SHARED_DATA_ID, JSON.stringify(normalized.settings || blankData().settings), now()]
       );
       await client.query(
@@ -3090,8 +2831,7 @@ async function api(req, res) {
     return res.end(csv);
   }
 
-  // Dedicated JSON backup restore endpoint. This replaces the shared JSONB document
-  // directly instead of routing the backup through the browser mutation-diff path.
+  // Dedicated JSON backup restore endpoint. The payload is converted into normalized PostgreSQL tables.
   // That avoids comparing/stringifying every record twice for large backups.
   if (method === 'POST' && parts[1] === 'backup' && parts[2] === 'restore' && !parts[3]) {
     if (!ADMIN_ROLES.has(u.role)) return send(res, 403, { error: 'Administrator permission required' });

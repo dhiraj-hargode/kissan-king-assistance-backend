@@ -475,9 +475,353 @@ async function countUsers() {
   return Number(result.rows[0].c);
 }
 
-async function userData() {
-  const r = await dataByShared();
+function rowJson(value) {
+  if (!value) return {};
+  if (typeof value === 'string') {
+    try { return JSON.parse(value); } catch { return {}; }
+  }
+  return value;
+}
 
+async function loadNormalizedData(executor = db) {
+  const [customersR, loansR, schedulesR, paymentsR, blacklistR, notificationsR, deletedR, expiredR, settingsR] = await Promise.all([
+    executor.query('SELECT data_json FROM customers ORDER BY id'),
+    executor.query('SELECT data_json FROM loans ORDER BY id'),
+    executor.query('SELECT data_json, manual_pending, pending_added_at, pending_added_by FROM schedules ORDER BY due_date NULLS LAST, id'),
+    executor.query('SELECT data_json FROM payments ORDER BY payment_date DESC NULLS LAST, id DESC'),
+    executor.query('SELECT data_json FROM blacklist ORDER BY blacklist_date DESC NULLS LAST, id DESC'),
+    executor.query('SELECT data_json FROM notifications ORDER BY created_at DESC NULLS LAST, id DESC'),
+    executor.query('SELECT data_json FROM deleted_records ORDER BY deleted_at DESC NULLS LAST, id DESC'),
+    executor.query('SELECT data_json FROM expired_customers ORDER BY expired_date DESC NULLS LAST, id DESC'),
+    executor.query(`SELECT COALESCE(data_json->'settings', '{}'::jsonb) AS settings FROM user_data WHERE user_id = $1`, [SHARED_DATA_ID])
+  ]);
+
+  const schedules = schedulesR.rows.map(r => {
+    const x = rowJson(r.data_json);
+    x.manualPending = Boolean(r.manual_pending);
+    if (r.pending_added_at) x.pendingAddedAt = new Date(r.pending_added_at).toISOString();
+    if (r.pending_added_by) x.pendingAddedBy = r.pending_added_by;
+    return x;
+  });
+
+  return normalizeData({
+    customers: customersR.rows.map(r => rowJson(r.data_json)),
+    loans: loansR.rows.map(r => rowJson(r.data_json)),
+    schedules,
+    payments: paymentsR.rows.map(r => rowJson(r.data_json)),
+    blacklist: blacklistR.rows.map(r => rowJson(r.data_json)),
+    notifications: notificationsR.rows.map(r => rowJson(r.data_json)),
+    deletedRecords: deletedR.rows.map(r => rowJson(r.data_json)),
+    expiredCustomers: expiredR.rows.map(r => rowJson(r.data_json)),
+    pendingQueue: schedulesR.rows
+      .filter(r => r.manual_pending === true)
+      .map(r => String(rowJson(r.data_json).id || ''))
+      .filter(Boolean),
+    settings: rowJson(settingsR.rows[0]?.settings)
+  });
+}
+
+async function syncNormalizedFull(client, data) {
+  const source = normalizeData(data);
+  const j = JSON.stringify;
+
+  // Dependency order matters because normalized tables use foreign keys.
+  await client.query('TRUNCATE TABLE payments, schedules, blacklist, notifications, deleted_records, expired_customers, loans, customers CASCADE');
+
+  await client.query(`
+    INSERT INTO customers
+      (id, first_name, middle_name, last_name, name, mobile, alternate_mobile, reference, address, city, district, pincode, status, created_at, updated_at, data_json)
+    SELECT
+      src.raw->>'id',
+      COALESCE(NULLIF(src.raw->>'firstName',''), NULLIF(src.raw->>'first_name','')),
+      COALESCE(NULLIF(src.raw->>'middleName',''), NULLIF(src.raw->>'middle_name','')),
+      COALESCE(NULLIF(src.raw->>'lastName',''), NULLIF(src.raw->>'last_name','')),
+      src.raw->>'name',
+      COALESCE(NULLIF(src.raw->>'mobile',''), NULLIF(src.raw->>'phone','')),
+      COALESCE(NULLIF(src.raw->>'alternateMobile',''), NULLIF(src.raw->>'alternate_mobile','')),
+      COALESCE(NULLIF(src.raw->>'reference',''), NULLIF(src.raw->>'customerReference','')),
+      src.raw->>'address', src.raw->>'city', src.raw->>'district', src.raw->>'pincode', src.raw->>'status',
+      NULLIF(COALESCE(src.raw->>'createdAt', src.raw->>'created_at'),'')::timestamptz,
+      NULLIF(COALESCE(src.raw->>'updatedAt', src.raw->>'updated_at'),'')::timestamptz,
+      src.raw
+    FROM jsonb_array_elements($1::jsonb) AS src(raw)
+    WHERE NULLIF(src.raw->>'id','') IS NOT NULL
+  `, [j(source.customers)]);
+
+  await client.query(`
+    INSERT INTO loans
+      (id, customer_id, khata_no, loan_type, loan_against, amount, rate, emi, emi_option, start_date, status, created_at, updated_at, data_json)
+    SELECT
+      src.raw->>'id',
+      COALESCE(NULLIF(src.raw->>'customerId',''), NULLIF(src.raw->>'customer_id','')),
+      COALESCE(NULLIF(src.raw->>'khataNo',''), NULLIF(src.raw->>'khata_no',''), NULLIF(src.raw->>'legacyKhataNo',''), NULLIF(src.raw->>'legacy_khata_no','')),
+      COALESCE(NULLIF(src.raw->>'loanType',''), NULLIF(src.raw->>'loan_type','')),
+      COALESCE(NULLIF(src.raw->>'loanAgainst',''), NULLIF(src.raw->>'loan_against','')),
+      COALESCE(NULLIF(src.raw->>'amount','')::numeric, 0),
+      COALESCE(NULLIF(src.raw->>'interestRate','')::numeric, NULLIF(src.raw->>'rate','')::numeric, 0),
+      COALESCE(NULLIF(src.raw->>'emi','')::numeric, 0),
+      COALESCE(NULLIF(src.raw->>'emiOption',''), NULLIF(src.raw->>'emi_option','')),
+      NULLIF(COALESCE(src.raw->>'startDate', src.raw->>'start_date'),'')::date,
+      src.raw->>'status',
+      NULLIF(COALESCE(src.raw->>'createdAt', src.raw->>'created_at'),'')::timestamptz,
+      NULLIF(COALESCE(src.raw->>'updatedAt', src.raw->>'updated_at'),'')::timestamptz,
+      src.raw
+    FROM jsonb_array_elements($1::jsonb) AS src(raw)
+    WHERE NULLIF(src.raw->>'id','') IS NOT NULL
+  `, [j(source.loans)]);
+
+  await client.query(`
+    INSERT INTO schedules
+      (id, loan_id, due_date, installment_no, emi, principal, interest, penalty, paid, remaining, status, manual_pending, pending_added_at, pending_added_by, data_json)
+    SELECT
+      src.raw->>'id',
+      COALESCE(NULLIF(src.raw->>'loanId',''), NULLIF(src.raw->>'loan_id','')),
+      NULLIF(COALESCE(src.raw->>'dueDate', src.raw->>'due_date'),'')::date,
+      COALESCE(NULLIF(src.raw->>'installment','')::int, NULLIF(src.raw->>'installmentNo','')::int, NULLIF(src.raw->>'installment_no','')::int),
+      COALESCE(NULLIF(src.raw->>'emi','')::numeric, 0),
+      COALESCE(NULLIF(src.raw->>'principal','')::numeric, 0),
+      COALESCE(NULLIF(src.raw->>'interest','')::numeric, 0),
+      COALESCE(NULLIF(src.raw->>'penalty','')::numeric, 0),
+      COALESCE(NULLIF(src.raw->>'paid','')::numeric, 0),
+      COALESCE(NULLIF(src.raw->>'remaining','')::numeric, 0),
+      src.raw->>'status',
+      COALESCE(NULLIF(src.raw->>'manualPending','')::boolean, NULLIF(src.raw->>'manual_pending','')::boolean, false),
+      NULLIF(COALESCE(src.raw->>'pendingAddedAt', src.raw->>'pending_added_at'),'')::timestamptz,
+      COALESCE(NULLIF(src.raw->>'pendingAddedBy',''), NULLIF(src.raw->>'pending_added_by','')),
+      src.raw
+    FROM jsonb_array_elements($1::jsonb) AS src(raw)
+    WHERE NULLIF(src.raw->>'id','') IS NOT NULL
+  `, [j(source.schedules)]);
+
+  await client.query(`
+    INSERT INTO payments
+      (id, loan_id, schedule_id, payment_date, principal, interest, penalty, total, mode, notes, created_at, activity_created_at, data_json)
+    SELECT
+      src.raw->>'id',
+      COALESCE(NULLIF(src.raw->>'loanId',''), NULLIF(src.raw->>'loan_id','')),
+      NULLIF(COALESCE(src.raw->>'scheduleId', src.raw->>'schedule_id'),'') ,
+      NULLIF(COALESCE(src.raw->>'date', src.raw->>'paymentDate', src.raw->>'payment_date'),'')::date,
+      COALESCE(NULLIF(src.raw->>'principal','')::numeric, 0),
+      COALESCE(NULLIF(src.raw->>'interest','')::numeric, 0),
+      COALESCE(NULLIF(src.raw->>'penalty','')::numeric, 0),
+      COALESCE(NULLIF(src.raw->>'total','')::numeric, 0),
+      src.raw->>'mode', src.raw->>'notes',
+      NULLIF(COALESCE(src.raw->>'createdAt', src.raw->>'created_at'),'')::timestamptz,
+      NULLIF(COALESCE(src.raw->>'activityCreatedAt', src.raw->>'activity_created_at'),'')::timestamptz,
+      src.raw
+    FROM jsonb_array_elements($1::jsonb) AS src(raw)
+    WHERE NULLIF(src.raw->>'id','') IS NOT NULL
+  `, [j(source.payments)]);
+
+  await client.query(`
+    INSERT INTO blacklist (id, customer_id, reason, blacklist_date, notes, outstanding, created_at, data_json)
+    SELECT src.raw->>'id',
+      COALESCE(NULLIF(src.raw->>'customerId',''), NULLIF(src.raw->>'customer_id','')),
+      src.raw->>'reason',
+      NULLIF(COALESCE(src.raw->>'date', src.raw->>'blacklistDate', src.raw->>'blacklist_date'),'')::date,
+      src.raw->>'notes', COALESCE(NULLIF(src.raw->>'outstanding','')::numeric,0),
+      NULLIF(COALESCE(src.raw->>'createdAt', src.raw->>'created_at'),'')::timestamptz, src.raw
+    FROM jsonb_array_elements($1::jsonb) AS src(raw)
+    WHERE NULLIF(src.raw->>'id','') IS NOT NULL
+  `, [j(source.blacklist)]);
+
+  await client.query(`
+    INSERT INTO notifications (id, customer_id, type, title, message, read, created_at, data_json)
+    SELECT src.raw->>'id', NULLIF(COALESCE(src.raw->>'customerId', src.raw->>'customer_id'),'') ,
+      src.raw->>'type', src.raw->>'title', src.raw->>'message',
+      COALESCE(NULLIF(src.raw->>'read','')::boolean, false),
+      NULLIF(COALESCE(src.raw->>'createdAt', src.raw->>'created_at'),'')::timestamptz, src.raw
+    FROM jsonb_array_elements($1::jsonb) AS src(raw)
+    WHERE NULLIF(src.raw->>'id','') IS NOT NULL
+  `, [j(source.notifications)]);
+
+  await client.query(`
+    INSERT INTO deleted_records (id, record_type, record_id, deleted_at, deleted_by, data_json)
+    SELECT src.raw->>'id', COALESCE(NULLIF(src.raw->>'recordType',''), NULLIF(src.raw->>'record_type','')),
+      COALESCE(NULLIF(src.raw->>'recordId',''), NULLIF(src.raw->>'record_id','')),
+      NULLIF(COALESCE(src.raw->>'deletedAt', src.raw->>'deleted_at'),'')::timestamptz,
+      COALESCE(NULLIF(src.raw->>'deletedBy',''), NULLIF(src.raw->>'deleted_by','')), src.raw
+    FROM jsonb_array_elements($1::jsonb) AS src(raw)
+    WHERE NULLIF(src.raw->>'id','') IS NOT NULL
+  `, [j(source.deletedRecords)]);
+
+  await client.query(`
+    INSERT INTO expired_customers (id, customer_id, reason, expired_date, notes, data_json)
+    SELECT src.raw->>'id', COALESCE(NULLIF(src.raw->>'customerId',''), NULLIF(src.raw->>'customer_id','')),
+      COALESCE(NULLIF(src.raw->>'reason',''), NULLIF(src.raw->>'status','')),
+      NULLIF(COALESCE(src.raw->>'date', src.raw->>'expiredDate', src.raw->>'expired_date'),'')::date,
+      src.raw->>'notes', src.raw
+    FROM jsonb_array_elements($1::jsonb) AS src(raw)
+    WHERE NULLIF(src.raw->>'id','') IS NOT NULL
+  `, [j(source.expiredCustomers)]);
+}
+
+async function syncNormalizedOperations(client, data, operations) {
+  const groups = {
+    customers: [], loans: [], schedules: [], payments: [], blacklist: [],
+    notifications: [], deletedRecords: [], expiredCustomers: []
+  };
+  const deletes = {
+    customers: [], loans: [], schedules: [], payments: [], blacklist: [],
+    notifications: [], deletedRecords: [], expiredCustomers: []
+  };
+  let replacePendingQueue = false;
+
+  for (const op of operations) {
+    const type = String(op.type || '');
+    const action = String(op.action || '');
+    if (type === 'pendingQueue' && action === 'replace') {
+      replacePendingQueue = true;
+      continue;
+    }
+    if (!groups[type]) continue;
+    const id = String(op.id ?? op.record?.id ?? '');
+    if (!id) continue;
+    if (action === 'create' || action === 'update') groups[type].push(op.record);
+    else if (action === 'delete') deletes[type].push(id);
+  }
+
+  // Deletes first for independent child records; customer/loan deletes use FK
+  // cascades and therefore happen after explicit child deletions.
+  for (const type of ['payments','schedules','blacklist','notifications','expiredCustomers','loans','customers','deletedRecords']) {
+    for (const id of deletes[type]) {
+      const table = type === 'expiredCustomers' ? 'expired_customers' :
+        type === 'deletedRecords' ? 'deleted_records' : type;
+      await client.query(`DELETE FROM ${table} WHERE id = $1`, [id]);
+    }
+  }
+
+  for (const c of groups.customers) {
+    await client.query(`
+      INSERT INTO customers
+        (id, first_name, middle_name, last_name, name, mobile, alternate_mobile, reference, address, city, district, pincode, status, created_at, updated_at, data_json)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16::jsonb)
+      ON CONFLICT (id) DO UPDATE SET
+        first_name=EXCLUDED.first_name, middle_name=EXCLUDED.middle_name, last_name=EXCLUDED.last_name,
+        name=EXCLUDED.name, mobile=EXCLUDED.mobile, alternate_mobile=EXCLUDED.alternate_mobile,
+        reference=EXCLUDED.reference, address=EXCLUDED.address, city=EXCLUDED.city, district=EXCLUDED.district,
+        pincode=EXCLUDED.pincode, status=EXCLUDED.status, created_at=EXCLUDED.created_at,
+        updated_at=EXCLUDED.updated_at, data_json=EXCLUDED.data_json
+    `, [
+      c.id, c.firstName || null, c.middleName || null, c.lastName || null, c.name || null,
+      c.mobile || c.phone || null, c.alternateMobile || null, c.reference || c.customerReference || null,
+      c.address || null, c.city || null, c.district || null, c.pincode || null, c.status || null,
+      c.createdAt || null, c.updatedAt || null, JSON.stringify(c)
+    ]);
+  }
+
+  for (const l of groups.loans) {
+    await client.query(`
+      INSERT INTO loans
+        (id, customer_id, khata_no, loan_type, loan_against, amount, rate, emi, emi_option, start_date, status, created_at, updated_at, data_json)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::jsonb)
+      ON CONFLICT (id) DO UPDATE SET
+        customer_id=EXCLUDED.customer_id, khata_no=EXCLUDED.khata_no, loan_type=EXCLUDED.loan_type,
+        loan_against=EXCLUDED.loan_against, amount=EXCLUDED.amount, rate=EXCLUDED.rate, emi=EXCLUDED.emi,
+        emi_option=EXCLUDED.emi_option, start_date=EXCLUDED.start_date, status=EXCLUDED.status,
+        created_at=EXCLUDED.created_at, updated_at=EXCLUDED.updated_at, data_json=EXCLUDED.data_json
+    `, [
+      l.id, l.customerId, l.khataNo || l.legacyKhataNo || null, l.loanType || null, l.loanAgainst || null,
+      Number(l.amount || 0), Number(l.interestRate ?? l.rate ?? 0), Number(l.emi || 0), l.emiOption || null,
+      l.startDate || null, l.status || null, l.createdAt || null, l.updatedAt || null, JSON.stringify(l)
+    ]);
+  }
+
+  for (const sc of groups.schedules) {
+    await client.query(`
+      INSERT INTO schedules
+        (id, loan_id, due_date, installment_no, emi, principal, interest, penalty, paid, remaining, status, manual_pending, pending_added_at, pending_added_by, data_json)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15::jsonb)
+      ON CONFLICT (id) DO UPDATE SET
+        loan_id=EXCLUDED.loan_id, due_date=EXCLUDED.due_date, installment_no=EXCLUDED.installment_no,
+        emi=EXCLUDED.emi, principal=EXCLUDED.principal, interest=EXCLUDED.interest, penalty=EXCLUDED.penalty,
+        paid=EXCLUDED.paid, remaining=EXCLUDED.remaining, status=EXCLUDED.status, manual_pending=EXCLUDED.manual_pending,
+        pending_added_at=EXCLUDED.pending_added_at, pending_added_by=EXCLUDED.pending_added_by, data_json=EXCLUDED.data_json
+    `, [
+      sc.id, sc.loanId, sc.dueDate || null, sc.installment ?? sc.installmentNo ?? null, Number(sc.emi || 0),
+      Number(sc.principal || 0), Number(sc.interest || 0), Number(sc.penalty || 0), Number(sc.paid || 0),
+      Number(sc.remaining || 0), sc.status || null, Boolean(sc.manualPending), sc.pendingAddedAt || null,
+      sc.pendingAddedBy || null, JSON.stringify(sc)
+    ]);
+  }
+
+  for (const pay of groups.payments) {
+    await client.query(`
+      INSERT INTO payments
+        (id, loan_id, schedule_id, payment_date, principal, interest, penalty, total, mode, notes, created_at, activity_created_at, data_json)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb)
+      ON CONFLICT (id) DO UPDATE SET
+        loan_id=EXCLUDED.loan_id, schedule_id=EXCLUDED.schedule_id, payment_date=EXCLUDED.payment_date,
+        principal=EXCLUDED.principal, interest=EXCLUDED.interest, penalty=EXCLUDED.penalty, total=EXCLUDED.total,
+        mode=EXCLUDED.mode, notes=EXCLUDED.notes, created_at=EXCLUDED.created_at,
+        activity_created_at=EXCLUDED.activity_created_at, data_json=EXCLUDED.data_json
+    `, [
+      pay.id, pay.loanId, pay.scheduleId || null, pay.date || pay.paymentDate || null,
+      Number(pay.principal || 0), Number(pay.interest || 0), Number(pay.penalty || 0), Number(pay.total || 0),
+      pay.mode || null, pay.notes || null, pay.createdAt || null, pay.activityCreatedAt || null, JSON.stringify(pay)
+    ]);
+  }
+
+  for (const b of groups.blacklist) {
+    await client.query(`
+      INSERT INTO blacklist (id, customer_id, reason, blacklist_date, notes, outstanding, created_at, data_json)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb)
+      ON CONFLICT (id) DO UPDATE SET customer_id=EXCLUDED.customer_id, reason=EXCLUDED.reason,
+        blacklist_date=EXCLUDED.blacklist_date, notes=EXCLUDED.notes, outstanding=EXCLUDED.outstanding,
+        created_at=EXCLUDED.created_at, data_json=EXCLUDED.data_json
+    `, [b.id, b.customerId, b.reason || null, b.date || b.blacklistDate || null, b.notes || null,
+      Number(b.outstanding || 0), b.createdAt || null, JSON.stringify(b)]);
+  }
+
+  for (const n of groups.notifications) {
+    await client.query(`
+      INSERT INTO notifications (id, customer_id, type, title, message, read, created_at, data_json)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb)
+      ON CONFLICT (id) DO UPDATE SET customer_id=EXCLUDED.customer_id, type=EXCLUDED.type,
+        title=EXCLUDED.title, message=EXCLUDED.message, read=EXCLUDED.read, created_at=EXCLUDED.created_at,
+        data_json=EXCLUDED.data_json
+    `, [n.id, n.customerId || null, n.type || null, n.title || null, n.message || null,
+      Boolean(n.read), n.createdAt || null, JSON.stringify(n)]);
+  }
+
+  for (const d of groups.deletedRecords) {
+    await client.query(`
+      INSERT INTO deleted_records (id, record_type, record_id, deleted_at, deleted_by, data_json)
+      VALUES ($1,$2,$3,$4,$5,$6::jsonb)
+      ON CONFLICT (id) DO UPDATE SET record_type=EXCLUDED.record_type, record_id=EXCLUDED.record_id,
+        deleted_at=EXCLUDED.deleted_at, deleted_by=EXCLUDED.deleted_by, data_json=EXCLUDED.data_json
+    `, [d.id, d.recordType || null, d.recordId || null, d.deletedAt || null, d.deletedBy || null, JSON.stringify(d)]);
+  }
+
+  for (const ex of groups.expiredCustomers) {
+    await client.query(`
+      INSERT INTO expired_customers (id, customer_id, reason, expired_date, notes, data_json)
+      VALUES ($1,$2,$3,$4,$5,$6::jsonb)
+      ON CONFLICT (id) DO UPDATE SET customer_id=EXCLUDED.customer_id, reason=EXCLUDED.reason,
+        expired_date=EXCLUDED.expired_date, notes=EXCLUDED.notes, data_json=EXCLUDED.data_json
+    `, [ex.id, ex.customerId, ex.reason || ex.status || null, ex.date || ex.expiredDate || null,
+      ex.notes || null, JSON.stringify(ex)]);
+  }
+
+  if (replacePendingQueue) {
+    const pending = new Set((data.pendingQueue || []).map(String));
+    await client.query(`UPDATE schedules SET manual_pending = (id = ANY($1::text[]))`, [[...pending]]);
+    // Keep the JSON representation compatible with the existing frontend contract.
+    await client.query(`
+      UPDATE schedules
+      SET data_json = CASE
+        WHEN manual_pending THEN jsonb_set(COALESCE(data_json,'{}'::jsonb), '{manualPending}', 'true'::jsonb, true)
+        ELSE jsonb_set(COALESCE(data_json,'{}'::jsonb), '{manualPending}', 'false'::jsonb, true)
+      END
+    `);
+  }
+}
+
+async function userData() {
+  const meta = await db.query('SELECT 1 FROM app_meta WHERE key = $1', ['normalized_data_v1']);
+  if (meta.rows.length) return loadNormalizedData();
+
+  const r = await dataByShared();
   if (!r) {
     const d = blankData();
     await db.query(
@@ -488,21 +832,34 @@ async function userData() {
     );
     return d;
   }
-
-  const value = typeof r.data_json === 'string' ? JSON.parse(r.data_json) : r.data_json;
-  return normalizeData(value);
+  return normalizeData(rowJson(r.data_json));
 }
 
 async function saveData(data) {
   const normalized = normalizeData(data);
-  await db.query(
-    `INSERT INTO user_data(user_id, data_json, updated_at)
-     VALUES ($1, $2::jsonb, $3)
-     ON CONFLICT (user_id) DO UPDATE
-     SET data_json = EXCLUDED.data_json,
-         updated_at = EXCLUDED.updated_at`,
-    [SHARED_DATA_ID, JSON.stringify(normalized), now()]
-  );
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+    await syncNormalizedFull(client, normalized);
+    await client.query(
+      `INSERT INTO user_data(user_id, data_json, updated_at)
+       VALUES ($1, $2::jsonb, $3)
+       ON CONFLICT (user_id) DO UPDATE
+       SET data_json = EXCLUDED.data_json, updated_at = EXCLUDED.updated_at`,
+      [SHARED_DATA_ID, JSON.stringify(normalized), now()]
+    );
+    await client.query(
+      `INSERT INTO app_meta(key, value) VALUES ($1,$2)
+       ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value`,
+      ['normalized_data_v1', now()]
+    );
+    await client.query('COMMIT');
+  } catch (e) {
+    try { await client.query('ROLLBACK'); } catch {}
+    throw e;
+  } finally {
+    client.release();
+  }
 }
 
 function hashPassword(password) {
@@ -1236,7 +1593,7 @@ async function normalizedMigrationStatus() {
       (SELECT COUNT(*)::int FROM notifications) AS notifications,
       (SELECT COUNT(*)::int FROM expired_customers) AS expired_customers
   `);
-  return { migratedAt: meta.rows[0]?.value || null, counts: counts.rows[0] || {} };
+  return { source: meta.rows[0] ? 'normalized_postgresql' : 'legacy_jsonb', legacyMirror: true, migratedAt: meta.rows[0]?.value || null, counts: counts.rows[0] || {} };
 }
 
 async function migrateJsonToNormalized() {
@@ -1452,12 +1809,8 @@ async function api(req, res) {
     });
   }
 
-  // Paginated customer read API. This is the first step toward removing
-  // large client-side customer scans. The current JSONB storage model is
-  // intentionally preserved for Phase 1/2; only the response is paginated.
-  // Paginated payment history API. The current JSONB storage model is preserved;
-  // only the requested payment rows are returned to the browser. Phase 3 can
-  // move this contract to a normalized PostgreSQL payments table.
+  // Paginated customer read API. This endpoint is directly backed by normalized PostgreSQL.
+  // Payment history reads are backed by normalized PostgreSQL via userData().
   if (method === 'GET' && parts[1] === 'payments' && parts[2]) {
     const u = await sessionUser(req);
     if (!u) return send(res, 401, { error: 'Authentication required' });
@@ -1542,9 +1895,7 @@ async function api(req, res) {
     });
   }
 
-  // Targeted collections read APIs. These return only the collection rows needed
-  // by the current page instead of forcing the browser to load the complete JSONB
-  // database. Phase 3 can move the same contracts to normalized SQL tables.
+  // Targeted collections read APIs. Data is sourced from normalized PostgreSQL via userData().
   if (method === 'GET' && parts[1] === 'collections' && parts[2] === 'today') {
     const u = await sessionUser(req);
     if (!u) return send(res, 401, { error: 'Authentication required' });
@@ -1784,9 +2135,7 @@ async function api(req, res) {
     });
   }
 
-  // Paginated loan read API. The JSONB storage model is preserved for now;
-  // only the response sent to the browser is paginated. Phase 3 can move the
-  // same contract to normalized PostgreSQL tables for true SQL pagination.
+  // Loan reads are backed by normalized PostgreSQL via userData().
   if (method === 'GET' && parts[1] === 'loans' && parts[2]) {
     const u = await sessionUser(req);
     if (!u) return send(res, 401, { error: 'Authentication required' });
@@ -1917,8 +2266,7 @@ async function api(req, res) {
     return send(res,200,{rows:rows.slice(start,start+limit),pagination:{page:safePage,limit,total,totalPages,hasNext:safePage<totalPages,hasPrevious:safePage>1},user:u});
   }
 
-  // Paginated blacklist list. Uses the existing JSONB store for now; Phase 3
-  // can move this contract to a normalized PostgreSQL table.
+  // Blacklist reads are backed by normalized PostgreSQL via userData().
   if (method === 'GET' && parts[1] === 'blacklist' && !parts[2]) {
     const u = await sessionUser(req);
     if (!u) return send(res, 401, { error: 'Authentication required' });
@@ -1977,8 +2325,7 @@ async function api(req, res) {
     return send(res,200,{rows:rows.slice(start,start+limit),pagination:{page:safePage,limit,total,totalPages,hasNext:safePage<totalPages,hasPrevious:safePage>1},user:u});
   }
 
-  // Targeted schedule search. Returns only matching loans; selecting one can
-  // reuse the existing /api/loans/:id detail endpoint.
+  // Targeted schedule search. Data is sourced from normalized PostgreSQL via userData().
   if (method === 'GET' && parts[1] === 'schedule' && parts[2] === 'search') {
     const u = await sessionUser(req);
     if (!u) return send(res,401,{error:'Authentication required'});
@@ -2474,14 +2821,10 @@ async function api(req, res) {
     const client = await db.connect();
     try {
       await client.query('BEGIN');
-      const result = await client.query('SELECT data_json FROM user_data WHERE user_id = $1 FOR UPDATE', [SHARED_DATA_ID]);
-      let data;
-      if (result.rows[0]) {
-        const value = typeof result.rows[0].data_json === 'string' ? JSON.parse(result.rows[0].data_json) : result.rows[0].data_json;
-        data = normalizeData(value);
-      } else {
-        data = blankData();
-      }
+      // Keep the shared JSON row only as a lightweight mutation lock. The
+      // actual business snapshot is now read from normalized PostgreSQL tables.
+      await client.query('SELECT user_id FROM user_data WHERE user_id = $1 FOR UPDATE', [SHARED_DATA_ID]);
+      const data = await loadNormalizedData(client);
 
       const arrays = new Set(['customers','loans','schedules','payments','blacklist','notifications','deletedRecords','expiredCustomers']);
       for (const op of operations) {
@@ -2517,11 +2860,21 @@ async function api(req, res) {
       }
 
       const normalized = normalizeData(data);
+      // Phase 3: persist every mutation to the normalized PostgreSQL tables in
+      // the same transaction as the legacy JSON mirror. Single-record changes
+      // use incremental upserts/deletes, avoiding a full-table rewrite on every
+      // payment or schedule update.
+      await syncNormalizedOperations(client, normalized, operations);
       await client.query(
         `INSERT INTO user_data(user_id, data_json, updated_at)
          VALUES ($1, $2::jsonb, $3)
          ON CONFLICT (user_id) DO UPDATE SET data_json = EXCLUDED.data_json, updated_at = EXCLUDED.updated_at`,
         [SHARED_DATA_ID, JSON.stringify(normalized), now()]
+      );
+      await client.query(
+        `INSERT INTO app_meta(key, value) VALUES ($1,$2)
+         ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value`,
+        ['normalized_data_v1', now()]
       );
       await client.query('COMMIT');
       return send(res, 200, { ok: true, applied: operations.length, user: u });

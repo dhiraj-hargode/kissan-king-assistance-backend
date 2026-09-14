@@ -1165,6 +1165,116 @@ async function api(req, res) {
     });
   }
 
+  // Paginated customer read API. This is the first step toward removing
+  // large client-side customer scans. The current JSONB storage model is
+  // intentionally preserved for Phase 1/2; only the response is paginated.
+  if (method === 'GET' && parts[1] === 'customers' && !parts[2]) {
+    const u = await sessionUser(req);
+    if (!u) return send(res, 401, { error: 'Authentication required' });
+
+    const url = new URL(req.url, 'http://localhost');
+    const rawPage = Number.parseInt(url.searchParams.get('page') || '1', 10);
+    const rawLimit = Number.parseInt(url.searchParams.get('limit') || '50', 10);
+    const page = Number.isFinite(rawPage) ? Math.max(1, rawPage) : 1;
+    const limit = Number.isFinite(rawLimit) ? Math.min(100, Math.max(1, rawLimit)) : 50;
+    const search = String(url.searchParams.get('search') || '').trim().toLowerCase().slice(0, 100);
+    const sort = String(url.searchParams.get('sort') || 'name');
+    const order = String(url.searchParams.get('order') || 'asc').toLowerCase() === 'desc' ? 'desc' : 'asc';
+
+    const allowedSorts = new Set(['id', 'name', 'mobile', 'city', 'district', 'createdAt', 'loanCount', 'totalLoan', 'remaining', 'status']);
+    const sortKey = allowedSorts.has(sort) ? sort : 'name';
+    const d = await userData();
+    const customers = Array.isArray(d.customers) ? d.customers : [];
+    const loans = Array.isArray(d.loans) ? d.loans : [];
+    const payments = Array.isArray(d.payments) ? d.payments : [];
+    const expiredIds = new Set((d.expiredCustomers || []).map(x => String(x.customerId)));
+    const blacklistedIds = new Set((d.blacklist || []).map(x => String(x.customerId)));
+
+    // Build loan and principal summaries in one pass each, so each customer
+    // is not repeatedly scanning all loans/payments.
+    const loanCountByCustomer = new Map();
+    const totalLoanByCustomer = new Map();
+    const loanIdsByCustomer = new Map();
+    const loanCustomerById = new Map();
+    for (const loan of loans) {
+      const cid = String(loan.customerId || '');
+      const lid = String(loan.id || '');
+      if (!cid) continue;
+      loanCountByCustomer.set(cid, (loanCountByCustomer.get(cid) || 0) + 1);
+      totalLoanByCustomer.set(cid, (totalLoanByCustomer.get(cid) || 0) + Number(loan.amount || 0));
+      if (!loanIdsByCustomer.has(cid)) loanIdsByCustomer.set(cid, new Set());
+      if (lid) loanIdsByCustomer.get(cid).add(lid);
+      if (lid) loanCustomerById.set(lid, cid);
+    }
+
+    const paidPrincipalByLoan = new Map();
+    for (const payment of payments) {
+      const lid = String(payment.loanId || '');
+      if (!lid) continue;
+      paidPrincipalByLoan.set(lid, (paidPrincipalByLoan.get(lid) || 0) + Number(payment.principal || 0));
+    }
+
+    const remainingByCustomer = new Map();
+    for (const loan of loans) {
+      const cid = String(loan.customerId || '');
+      if (!cid) continue;
+      const remaining = Math.max(0, Number(loan.amount || 0) - (paidPrincipalByLoan.get(String(loan.id || '')) || 0));
+      remainingByCustomer.set(cid, (remainingByCustomer.get(cid) || 0) + remaining);
+    }
+
+    const customerRows = [];
+    for (const customer of customers) {
+      const cid = String(customer.id || '');
+      if (!cid || expiredIds.has(cid)) continue;
+
+      const name = [customer.firstName, customer.middleName, customer.lastName].filter(Boolean).join(' ') || String(customer.name || cid);
+      const city = String(customer.city || customer.village || '');
+      const mobile = String(customer.mobile || '');
+      const district = String(customer.district || '');
+      const reference = String(customer.reference || customer.customerReference || '');
+      const loanCount = loanCountByCustomer.get(cid) || 0;
+      const totalLoan = totalLoanByCustomer.get(cid) || 0;
+      const remaining = remainingByCustomer.get(cid) || 0;
+      const status = blacklistedIds.has(cid) ? 'BLACKLISTED' : (loanCount > 0 && remaining <= 0.005 ? 'COMPLETED' : 'ACTIVE');
+      const haystack = `${cid} ${name} ${mobile} ${city} ${district} ${reference} ${customer.address || ''} ${status}`.toLowerCase();
+
+      if (search && !haystack.includes(search)) continue;
+
+      customerRows.push({
+        ...customer,
+        city,
+        loanCount,
+        totalLoan,
+        remaining,
+        status
+      });
+    }
+
+    const compare = (a, b) => {
+      let av = a[sortKey];
+      let bv = b[sortKey];
+      if (sortKey === 'name') { av = [a.firstName, a.middleName, a.lastName].filter(Boolean).join(' ') || a.name || a.id; bv = [b.firstName, b.middleName, b.lastName].filter(Boolean).join(' ') || b.name || b.id; }
+      if (typeof av === 'number' && typeof bv === 'number') return av - bv;
+      return String(av ?? '').localeCompare(String(bv ?? ''), undefined, { numeric: true, sensitivity: 'base' });
+    };
+    customerRows.sort((a, b) => {
+      const result = compare(a, b);
+      return order === 'desc' ? -result : result;
+    });
+
+    const total = customerRows.length;
+    const totalPages = Math.max(1, Math.ceil(total / limit));
+    const safePage = Math.min(page, totalPages);
+    const start = (safePage - 1) * limit;
+    const data = customerRows.slice(start, start + limit);
+
+    return send(res, 200, {
+      customers: data,
+      pagination: { page: safePage, limit, total, totalPages, hasNext: safePage < totalPages, hasPrevious: safePage > 1 },
+      user: u
+    });
+  }
+
   if (parts[1] === 'auth') {
     if (method === 'POST' && parts[2] === 'register') {
       const requester = await sessionUser(req);

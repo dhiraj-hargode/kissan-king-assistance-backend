@@ -1165,6 +1165,42 @@ async function api(req, res) {
     });
   }
 
+  // Lazy-load one customer's details. This keeps the customer list lightweight
+  // while allowing the profile modal to fetch only the selected customer's data.
+  if (method === 'GET' && parts[1] === 'customers' && parts[2]) {
+    const u = await sessionUser(req);
+    if (!u) return send(res, 401, { error: 'Authentication required' });
+
+    const customerId = decodeURIComponent(String(parts[2] || ''));
+    if (!customerId || customerId.length > 100) return send(res, 400, { error: 'Invalid customer ID' });
+
+    const d = await userData();
+    const customers = Array.isArray(d.customers) ? d.customers : [];
+    const loans = Array.isArray(d.loans) ? d.loans : [];
+    const payments = Array.isArray(d.payments) ? d.payments : [];
+    const schedules = Array.isArray(d.schedules) ? d.schedules : [];
+
+    const customer = customers.find(c => String(c.id) === customerId);
+    if (!customer) return send(res, 404, { error: 'Customer not found' });
+
+    const customerLoans = loans.filter(l => String(l.customerId) === customerId);
+    const loanIds = new Set(customerLoans.map(l => String(l.id)));
+    const customerPayments = payments.filter(p => loanIds.has(String(p.loanId)));
+    const customerSchedules = schedules.filter(s => loanIds.has(String(s.loanId)));
+    const blacklist = (d.blacklist || []).filter(x => String(x.customerId) === customerId);
+    const expired = (d.expiredCustomers || []).filter(x => String(x.customerId) === customerId);
+
+    return send(res, 200, {
+      customer,
+      loans: customerLoans,
+      payments: customerPayments,
+      schedules: customerSchedules,
+      blacklist,
+      expired,
+      user: u
+    });
+  }
+
   // Paginated customer read API. This is the first step toward removing
   // large client-side customer scans. The current JSONB storage model is
   // intentionally preserved for Phase 1/2; only the response is paginated.

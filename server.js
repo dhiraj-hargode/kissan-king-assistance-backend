@@ -1931,6 +1931,69 @@ async function api(req, res) {
     }
   }
 
+  // Targeted customer create API. The browser sends only the new customer
+  // instead of downloading and PUTing the entire shared JSON document.
+  if (method === 'POST' && parts[1] === 'customers' && !parts[2]) {
+    if (!WRITE_ROLES.has(u.role)) return send(res, 403, { error: 'You do not have write permission' });
+
+    let b;
+    try {
+      b = await readBody(req);
+    } catch (e) {
+      return send(res, 400, { error: e.message || 'Invalid request body' });
+    }
+
+    const incoming = b?.customer && typeof b.customer === 'object' ? { ...b.customer } : null;
+    if (!incoming) return send(res, 400, { error: 'Customer data is required' });
+
+    const firstName = String(incoming.firstName || '').trim();
+    const mobile = String(incoming.mobile || '').trim();
+    const city = String(incoming.city || incoming.village || '').trim();
+    const district = String(incoming.district || '').trim();
+    const guarantorMobile = String(incoming.guarantorMobile || '').trim();
+    const pincode = String(incoming.pincode || '').trim();
+
+    if (!firstName) return send(res, 400, { error: 'Customer name is required' });
+    if (!mobileOk(mobile, true)) return send(res, 400, { error: 'Enter a valid 10-digit customer mobile number' });
+    if (!city) return send(res, 400, { error: 'City is required' });
+    if (!district) return send(res, 400, { error: 'District is required' });
+    if (pincode && !/^\d{6}$/.test(pincode)) return send(res, 400, { error: 'Pincode must be 6 digits' });
+    if (guarantorMobile && !mobileOk(guarantorMobile, false)) return send(res, 400, { error: 'Enter a valid guarantor mobile number' });
+
+    const d = await userData();
+    const customers = Array.isArray(d.customers) ? d.customers : [];
+    if (customers.some(c => String(c?.mobile || '').trim() === mobile)) {
+      return send(res, 409, { error: 'A customer with this mobile number already exists' });
+    }
+
+    let maxId = 0;
+    for (const c of customers) {
+      const m = String(c?.id || '').match(/^KK-(\d+)$/i);
+      if (m) maxId = Math.max(maxId, Number(m[1]) || 0);
+    }
+    const id = `KK-${String(maxId + 1).padStart(6, '0')}`;
+    const createdAt = now();
+    const customer = {
+      ...incoming,
+      id,
+      state: 'Maharashtra',
+      taluka: String(incoming.taluka || ''),
+      ownerId: u.id,
+      createdAt,
+      activityCreatedAt: createdAt
+    };
+
+    d.customers.push(customer);
+    try {
+      await saveData(d);
+    } catch (e) {
+      console.error('Customer create failed:', e);
+      return send(res, 500, { error: e.message || 'Could not save customer' });
+    }
+
+    return send(res, 201, { ok: true, customer, user: u });
+  }
+
   if (method === 'GET' && parts[1] === 'db') {
     return send(res, 200, { data: await userData(), user: u });
   }

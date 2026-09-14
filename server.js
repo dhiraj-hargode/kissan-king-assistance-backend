@@ -1179,6 +1179,42 @@ async function api(req, res) {
   // Paginated payment history API. The current JSONB storage model is preserved;
   // only the requested payment rows are returned to the browser. Phase 3 can
   // move this contract to a normalized PostgreSQL payments table.
+  if (method === 'DELETE' && parts[1] === 'payments' && parts[2]) {
+    const u = await sessionUser(req);
+    if (!u) return send(res, 401, { error: 'Authentication required' });
+    if (u.role !== 'Administrator') return send(res, 403, { error: 'Administrator access required' });
+    const paymentId = decodeURIComponent(parts[2]);
+    const d = await userData(u.userId);
+    const payments = Array.isArray(d.payments) ? d.payments : [];
+    const payment = payments.find(p => String(p?.id) === String(paymentId));
+    if (!payment) return send(res, 404, { error: 'Payment not found' });
+
+    d.deletedRecords = Array.isArray(d.deletedRecords) ? d.deletedRecords : [];
+    d.deletedRecords.push({
+      id: 'DEL-' + crypto.randomBytes(6).toString('hex').toUpperCase(),
+      type: 'payment',
+      recordId: payment.id,
+      deletedAt: now(),
+      deletedBy: u.username || u.userId,
+      reason: 'Manual deletion',
+      data: { payment: { ...payment } }
+    });
+
+    if (payment.scheduleId) {
+      const schedule = (d.schedules || []).find(s => String(s?.id) === String(payment.scheduleId));
+      if (schedule) {
+        schedule.paid = Math.max(0,
+          Number(schedule.paid || 0) - Number(payment.principal || 0) - Number(payment.interest || 0)
+        );
+        schedule.status = String(schedule.paid || 0) >= Number(schedule.emi || 0) ? 'PAID' : 'PENDING';
+      }
+    }
+
+    d.payments = payments.filter(p => String(p?.id) !== String(paymentId));
+    await saveData(d);
+    return send(res, 200, { ok: true, paymentId: payment.id, user: u });
+  }
+
   if (method === 'GET' && parts[1] === 'payments' && parts[2]) {
     const u = await sessionUser(req);
     if (!u) return send(res, 401, { error: 'Authentication required' });

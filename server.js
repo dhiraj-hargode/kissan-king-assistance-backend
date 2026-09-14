@@ -562,7 +562,7 @@ function readBody(req) {
     let b = '';
     req.on('data', c => {
       b += c;
-      if (b.length > 10 * 1024 * 1024) req.destroy();
+      if (b.length > 50 * 1024 * 1024) req.destroy();
     });
     req.on('end', () => {
       try {

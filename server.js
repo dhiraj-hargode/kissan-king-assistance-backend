@@ -38,6 +38,20 @@ const PAYMENT_ROLES = new Set(['Administrator']);
 const ADMIN_ROLES = new Set(['Administrator']);
 let excelImportInProgress = false;
 
+// Short-lived normalized-data cache. Read-heavy screens (dashboard, reports,
+// search, overdue, etc.) used to re-read every row from PostgreSQL on every
+// request. Writes invalidate the cache, so financial data remains authoritative
+// while repeated reads become much cheaper.
+const DATA_CACHE_TTL_MS = Number(process.env.DATA_CACHE_TTL_MS || 5000);
+let normalizedDataCache = null;
+let normalizedDataCacheAt = 0;
+let normalizedDataLoadPromise = null;
+
+function invalidateNormalizedDataCache() {
+  normalizedDataCache = null;
+  normalizedDataCacheAt = 0;
+}
+
 function now() {
   return new Date().toISOString();
 }
@@ -345,11 +359,12 @@ async function initDb() {
   await db.query('CREATE INDEX IF NOT EXISTS idx_loans_status ON loans(status)');
   await db.query('CREATE INDEX IF NOT EXISTS idx_schedules_loan_id ON schedules(loan_id)');
   await db.query('CREATE INDEX IF NOT EXISTS idx_schedules_due_date ON schedules(due_date)');
-  await db.query('CREATE INDEX IF NOT EXISTS idx_schedules_pending_due ON schedules(due_date, id) WHERE manual_pending = TRUE AND pending_added_at IS NOT NULL');
-  await db.query('CREATE INDEX IF NOT EXISTS idx_schedules_pending_loan ON schedules(loan_id) WHERE manual_pending = TRUE AND pending_added_at IS NOT NULL');
+  await db.query('CREATE INDEX IF NOT EXISTS idx_schedules_pending ON schedules(manual_pending, due_date) WHERE manual_pending = TRUE');
+  await db.query('CREATE INDEX IF NOT EXISTS idx_schedules_loan_due ON schedules(loan_id, due_date, installment_no)');
   await db.query('CREATE INDEX IF NOT EXISTS idx_payments_loan_id ON payments(loan_id)');
   await db.query('CREATE INDEX IF NOT EXISTS idx_payments_schedule_id ON payments(schedule_id)');
-  await db.query('CREATE INDEX IF NOT EXISTS idx_payments_schedule_date ON payments(schedule_id, payment_date)');
+  await db.query('CREATE INDEX IF NOT EXISTS idx_payments_schedule_date ON payments(schedule_id, payment_date DESC)');
+  await db.query('CREATE INDEX IF NOT EXISTS idx_payments_loan_date ON payments(loan_id, payment_date DESC)');
   await db.query('CREATE INDEX IF NOT EXISTS idx_payments_date ON payments(payment_date)');
   await db.query('CREATE INDEX IF NOT EXISTS idx_blacklist_customer_id ON blacklist(customer_id)');
   await db.query('CREATE INDEX IF NOT EXISTS idx_expired_customers_customer_id ON expired_customers(customer_id)');
@@ -464,41 +479,60 @@ function rowJson(value) {
 }
 
 async function loadNormalizedData(executor = db) {
-  const [customersR, loansR, schedulesR, paymentsR, blacklistR, notificationsR, deletedR, expiredR, settingsR] = await Promise.all([
-    executor.query('SELECT data_json FROM customers ORDER BY id'),
-    executor.query('SELECT data_json FROM loans ORDER BY id'),
-    executor.query('SELECT data_json, manual_pending, pending_added_at, pending_added_by FROM schedules ORDER BY due_date NULLS LAST, id'),
-    executor.query('SELECT data_json FROM payments ORDER BY payment_date DESC NULLS LAST, id DESC'),
-    executor.query('SELECT data_json FROM blacklist ORDER BY blacklist_date DESC NULLS LAST, id DESC'),
-    executor.query('SELECT data_json FROM notifications ORDER BY created_at DESC NULLS LAST, id DESC'),
-    executor.query('SELECT data_json FROM deleted_records ORDER BY deleted_at DESC NULLS LAST, id DESC'),
-    executor.query('SELECT data_json FROM expired_customers ORDER BY expired_date DESC NULLS LAST, id DESC'),
-    executor.query(`SELECT COALESCE(settings, '{}'::jsonb) AS settings FROM app_settings WHERE id = $1`, [SHARED_DATA_ID])
-  ]);
+  const cacheable = executor === db;
+  if (cacheable && normalizedDataCache && (Date.now() - normalizedDataCacheAt) < DATA_CACHE_TTL_MS) {
+    return normalizedDataCache;
+  }
+  if (cacheable && normalizedDataLoadPromise) return normalizedDataLoadPromise;
 
-  const schedules = schedulesR.rows.map(r => {
-    const x = rowJson(r.data_json);
-    x.manualPending = Boolean(r.manual_pending);
-    if (r.pending_added_at) x.pendingAddedAt = new Date(r.pending_added_at).toISOString();
-    if (r.pending_added_by) x.pendingAddedBy = r.pending_added_by;
-    return x;
-  });
+  const load = (async () => {
+    const [customersR, loansR, schedulesR, paymentsR, blacklistR, notificationsR, deletedR, expiredR, settingsR] = await Promise.all([
+      executor.query('SELECT data_json FROM customers ORDER BY id'),
+      executor.query('SELECT data_json FROM loans ORDER BY id'),
+      executor.query('SELECT data_json, manual_pending, pending_added_at, pending_added_by FROM schedules ORDER BY due_date NULLS LAST, id'),
+      executor.query('SELECT data_json FROM payments ORDER BY payment_date DESC NULLS LAST, id DESC'),
+      executor.query('SELECT data_json FROM blacklist ORDER BY blacklist_date DESC NULLS LAST, id DESC'),
+      executor.query('SELECT data_json FROM notifications ORDER BY created_at DESC NULLS LAST, id DESC'),
+      executor.query('SELECT data_json FROM deleted_records ORDER BY deleted_at DESC NULLS LAST, id DESC'),
+      executor.query('SELECT data_json FROM expired_customers ORDER BY expired_date DESC NULLS LAST, id DESC'),
+      executor.query(`SELECT COALESCE(settings, '{}'::jsonb) AS settings FROM app_settings WHERE id = $1`, [SHARED_DATA_ID])
+    ]);
 
-  return normalizeData({
-    customers: customersR.rows.map(r => rowJson(r.data_json)),
-    loans: loansR.rows.map(r => rowJson(r.data_json)),
-    schedules,
-    payments: paymentsR.rows.map(r => rowJson(r.data_json)),
-    blacklist: blacklistR.rows.map(r => rowJson(r.data_json)),
-    notifications: notificationsR.rows.map(r => rowJson(r.data_json)),
-    deletedRecords: deletedR.rows.map(r => rowJson(r.data_json)),
-    expiredCustomers: expiredR.rows.map(r => rowJson(r.data_json)),
-    pendingQueue: schedulesR.rows
-      .filter(r => r.manual_pending === true)
-      .map(r => String(rowJson(r.data_json).id || ''))
-      .filter(Boolean),
-    settings: rowJson(settingsR.rows[0]?.settings)
-  });
+    const schedules = schedulesR.rows.map(r => {
+      const x = rowJson(r.data_json);
+      x.manualPending = Boolean(r.manual_pending);
+      if (r.pending_added_at) x.pendingAddedAt = new Date(r.pending_added_at).toISOString();
+      if (r.pending_added_by) x.pendingAddedBy = r.pending_added_by;
+      return x;
+    });
+
+    const result = normalizeData({
+      customers: customersR.rows.map(r => rowJson(r.data_json)),
+      loans: loansR.rows.map(r => rowJson(r.data_json)),
+      schedules,
+      payments: paymentsR.rows.map(r => rowJson(r.data_json)),
+      blacklist: blacklistR.rows.map(r => rowJson(r.data_json)),
+      notifications: notificationsR.rows.map(r => rowJson(r.data_json)),
+      deletedRecords: deletedR.rows.map(r => rowJson(r.data_json)),
+      expiredCustomers: expiredR.rows.map(r => rowJson(r.data_json)),
+      pendingQueue: schedulesR.rows.filter(r => r.manual_pending === true).map(r => String(rowJson(r.data_json).id || '')).filter(Boolean),
+      settings: rowJson(settingsR.rows[0]?.settings)
+    });
+
+    if (cacheable) {
+      normalizedDataCache = result;
+      normalizedDataCacheAt = Date.now();
+    }
+    return result;
+  })();
+
+  if (!cacheable) return load;
+  normalizedDataLoadPromise = load;
+  try {
+    return await load;
+  } finally {
+    normalizedDataLoadPromise = null;
+  }
 }
 
 async function syncNormalizedFull(client, data) {
@@ -785,15 +819,12 @@ async function syncNormalizedOperations(client, data, operations) {
 
   if (replacePendingQueue) {
     const pending = new Set((data.pendingQueue || []).map(String));
-    await client.query(`UPDATE schedules SET manual_pending = (id = ANY($1::text[]))`, [[...pending]]);
-    // Keep the JSON representation compatible with the existing frontend contract.
     await client.query(`
       UPDATE schedules
-      SET data_json = CASE
-        WHEN manual_pending THEN jsonb_set(COALESCE(data_json,'{}'::jsonb), '{manualPending}', 'true'::jsonb, true)
-        ELSE jsonb_set(COALESCE(data_json,'{}'::jsonb), '{manualPending}', 'false'::jsonb, true)
-      END
-    `);
+      SET manual_pending = (id = ANY($1::text[])),
+          data_json = jsonb_set(COALESCE(data_json,'{}'::jsonb), '{manualPending}', to_jsonb(id = ANY($1::text[])), true)
+      WHERE manual_pending IS DISTINCT FROM (id = ANY($1::text[]))
+    `, [[...pending]]);
   }
 }
 
@@ -820,6 +851,7 @@ async function saveData(data) {
       ['normalized_data_v1', now()]
     );
     await client.query('COMMIT');
+    invalidateNormalizedDataCache();
   } catch (e) {
     try { await client.query('ROLLBACK'); } catch { }
     throw e;
@@ -1929,7 +1961,6 @@ async function api(req, res) {
   if (method === 'GET' && parts[1] === 'collections' && parts[2] === 'pending') {
     const u = await sessionUser(req);
     if (!u) return send(res, 401, { error: 'Authentication required' });
-
     const url = new URL(req.url, 'http://localhost');
     const rawPage = Number.parseInt(url.searchParams.get('page') || '1', 10);
     const rawLimit = Number.parseInt(url.searchParams.get('limit') || '50', 10);
@@ -1937,126 +1968,54 @@ async function api(req, res) {
     const limit = Number.isFinite(rawLimit) ? Math.min(100, Math.max(1, rawLimit)) : 50;
     const search = String(url.searchParams.get('search') || '').trim().toLowerCase().slice(0, 100);
     const asOf = isoDateFromQuery(url.searchParams.get('date'));
-    const offset = (page - 1) * limit;
-
-    // Pending Payments is a database queue. Read only pending schedules and
-    // aggregate payments for those schedules; never load the full database.
-    const result = await db.query(`
-      WITH pending AS (
-        SELECT
-          s.id,
-          s.loan_id,
-          s.due_date,
-          s.data_json AS schedule_json,
-          l.data_json AS loan_json,
-          l.status AS loan_status,
-          l.customer_id,
-          c.data_json AS customer_json,
-          COALESCE(SUM(p.principal + p.interest), 0)::numeric AS paid_principal_interest,
-          COALESCE(SUM(p.penalty), 0)::numeric AS paid_penalty
-        FROM schedules s
-        JOIN loans l ON l.id = s.loan_id
-        JOIN customers c ON c.id = l.customer_id
-        LEFT JOIN payments p ON p.schedule_id = s.id
-        WHERE s.manual_pending = TRUE
-          AND s.pending_added_at IS NOT NULL
-          AND NOT EXISTS (
-            SELECT 1 FROM expired_customers e WHERE e.customer_id = l.customer_id
-          )
-        GROUP BY s.id, l.id, c.id
-      ),
-      calculated AS (
-        SELECT
-          *,
-          ROUND((
-            GREATEST(0, COALESCE((schedule_json->>'emi')::numeric, 0)
-              - GREATEST(COALESCE((schedule_json->>'paid')::numeric, 0), paid_principal_interest))
-            + GREATEST(0, COALESCE((schedule_json->>'penalty')::numeric, 0) - paid_penalty)
-          ), 2) AS pending_amount
-        FROM pending
-      ),
-      filtered AS (
-        SELECT
-          *,
-          CASE
-            WHEN due_date < $1::date THEN 'OVERDUE'
-            WHEN due_date = $1::date THEN 'DUE TODAY'
-            ELSE 'UPCOMING'
-          END AS collection_status
-        FROM calculated
-        WHERE pending_amount > 0.005
-          AND UPPER(COALESCE(loan_status, '')) <> 'CLOSED'
-          AND (
-            $2 = '' OR
-            LOWER(CONCAT_WS(' ',
-              customer_json->>'firstName', customer_json->>'middleName', customer_json->>'lastName',
-              customer_json->>'mobile', customer_json->>'id',
-              loan_json->>'khataNo', loan_json->>'legacyKhataNo', loan_json->>'id'
-            )) LIKE '%' || $2 || '%'
-          )
-      ),
-      summary AS (
-        SELECT
-          COUNT(*)::int AS total_count,
-          COALESCE(SUM(pending_amount), 0)::numeric AS total_pending,
-          COUNT(*) FILTER (WHERE collection_status = 'OVERDUE')::int AS overdue_emis,
-          COUNT(DISTINCT loan_id) FILTER (WHERE collection_status = 'OVERDUE')::int AS overdue_loans,
-          COALESCE(SUM(pending_amount) FILTER (WHERE collection_status = 'DUE TODAY'), 0)::numeric AS due_today
-        FROM filtered
-      ),
-      page_rows AS (
-        SELECT *
-        FROM filtered
-        ORDER BY due_date DESC NULLS LAST, id DESC
-        LIMIT $3 OFFSET $4
-      )
-      SELECT p.*, s.total_count, s.total_pending, s.overdue_emis, s.overdue_loans, s.due_today
-      FROM summary s
-      LEFT JOIN page_rows p ON TRUE
-      ORDER BY p.due_date DESC NULLS LAST, p.id DESC
-    `, [asOf, search, limit, offset]);
-
-    const total = Number(result.rows[0]?.total_count || 0);
+    const d = await userData();
+    const customers = Array.isArray(d.customers) ? d.customers : [];
+    const loans = Array.isArray(d.loans) ? d.loans : [];
+    const schedules = Array.isArray(d.schedules) ? d.schedules : [];
+    const payments = Array.isArray(d.payments) ? d.payments : [];
+    const expired = new Set((Array.isArray(d.expiredCustomers) ? d.expiredCustomers : []).map(x => String(x?.customerId || x?.id || '')));
+    const pendingIds = new Set((Array.isArray(d.pendingQueue) ? d.pendingQueue : []).map(String));
+    const customerById = new Map(customers.map(c => [String(c.id), c]));
+    const loanById = new Map(loans.map(l => [String(l.id), l]));
+    const totals = new Map();
+    for (const p of payments) {
+      const sid = String(p?.scheduleId || '').trim();
+      if (!sid) continue;
+      const x = totals.get(sid) || { principalInterest: 0, penalty: 0 };
+      x.principalInterest += Number(p?.principal || 0) + Number(p?.interest || 0);
+      x.penalty += Number(p?.penalty || 0);
+      totals.set(sid, x);
+    }
+    const due = s => {
+      const t = totals.get(String(s?.id)) || { principalInterest: 0, penalty: 0 };
+      return Number((Math.max(0, Number(s?.emi || 0) - Math.max(Number(s?.paid || 0), t.principalInterest)) + Math.max(0, Number(s?.penalty || 0) - t.penalty)).toFixed(2));
+    };
+    const rows = [];
+    for (const s of schedules) {
+      if (!pendingIds.has(String(s?.id)) || !s?.pendingAddedAt) continue;
+      const l = loanById.get(String(s?.loanId || ''));
+      if (!l || expired.has(String(l.customerId))) continue;
+      const c = customerById.get(String(l.customerId)) || null;
+      const pending = due(s);
+      if (pending <= 0.005 || String(l.status || '').toUpperCase() === 'CLOSED') continue;
+      const status = String(s.dueDate) < asOf ? 'OVERDUE' : String(s.dueDate) === asOf ? 'DUE TODAY' : 'UPCOMING';
+      const khata = l?.legacyKhataNo || l?.khataNo || l?.id || '-';
+      const haystack = [c?.firstName, c?.middleName, c?.lastName, c?.mobile, c?.id, khata, l?.id, status].filter(Boolean).join(' ').toLowerCase();
+      if (search && !haystack.includes(search)) continue;
+      rows.push({ schedule: s, loan: l, customer: c, pending, status, daysLate: Math.max(0, Math.floor((new Date(asOf + 'T00:00:00') - new Date(String(s.dueDate) + 'T00:00:00')) / 86400000)) });
+    }
+    rows.sort((a, b) => String(b.schedule?.dueDate || '').localeCompare(String(a.schedule?.dueDate || '')));
+    const total = rows.length;
     const totalPages = Math.max(1, Math.ceil(total / limit));
     const safePage = Math.min(page, totalPages);
-
-    const rows = result.rows.filter(r => r.id != null).map(r => {
-      const schedule = {
-        ...(r.schedule_json || {}),
-        manualPending: true
-      };
-      const loan = r.loan_json || {};
-      const customer = r.customer_json || null;
-      const daysLate = Math.max(0, Math.floor(
-        (new Date(asOf + 'T00:00:00') - new Date(String(r.due_date) + 'T00:00:00')) / 86400000
-      ));
-      return {
-        schedule,
-        loan,
-        customer,
-        pending: Number(r.pending_amount),
-        status: r.collection_status,
-        daysLate
-      };
-    });
-
-    const first = result.rows[0];
+    const start = (safePage - 1) * limit;
+    const data = rows.slice(start, start + limit);
+    const overdue = rows.filter(r => r.status === 'OVERDUE');
+    const dueToday = rows.filter(r => r.status === 'DUE TODAY');
     return send(res, 200, {
-      rows,
-      summary: {
-        totalPending: Number(first?.total_pending || 0),
-        overdueLoans: Number(first?.overdue_loans || 0),
-        overdueEmis: Number(first?.overdue_emis || 0),
-        dueToday: Number(first?.due_today || 0)
-      },
-      pagination: {
-        page: safePage,
-        limit,
-        total,
-        totalPages,
-        hasNext: safePage < totalPages,
-        hasPrevious: safePage > 1
-      },
+      rows: data,
+      summary: { totalPending: rows.reduce((sum, r) => sum + r.pending, 0), overdueLoans: new Set(overdue.map(r => r.loan.id)).size, overdueEmis: overdue.length, dueToday: dueToday.reduce((sum, r) => sum + r.pending, 0) },
+      pagination: { page: safePage, limit, total, totalPages, hasNext: safePage < totalPages, hasPrevious: safePage > 1 },
       user: u
     });
   }
@@ -2757,38 +2716,34 @@ async function api(req, res) {
     if (pincode && !/^\d{6}$/.test(pincode)) return send(res, 400, { error: 'Pincode must be 6 digits' });
     if (guarantorMobile && !mobileOk(guarantorMobile, false)) return send(res, 400, { error: 'Enter a valid guarantor mobile number' });
 
-    const d = await userData();
-    const customers = Array.isArray(d.customers) ? d.customers : [];
-    if (customers.some(c => String(c?.mobile || '').trim() === mobile)) {
-      return send(res, 409, { error: 'A customer with this mobile number already exists' });
-    }
-
-    let maxId = 0;
-    for (const c of customers) {
-      const m = String(c?.id || '').match(/^KK-(\d+)$/i);
-      if (m) maxId = Math.max(maxId, Number(m[1]) || 0);
-    }
-    const id = `KK-${String(maxId + 1).padStart(6, '0')}`;
-    const createdAt = now();
-    const customer = {
-      ...incoming,
-      id,
-      state: 'Maharashtra',
-      taluka: String(incoming.taluka || ''),
-      ownerId: u.id,
-      createdAt,
-      activityCreatedAt: createdAt
-    };
-
-    d.customers.push(customer);
     try {
-      await saveData(d);
+      const duplicate = await db.query('SELECT 1 FROM customers WHERE mobile = $1 LIMIT 1', [mobile]);
+      if (duplicate.rows.length) return send(res, 409, { error: 'A customer with this mobile number already exists' });
+
+      const idResult = await db.query(`
+        SELECT COALESCE(MAX((regexp_replace(id, '^KK-', '', 'i'))::bigint), 0) AS max_id
+        FROM customers WHERE id ~* '^KK-[0-9]+$'
+      `);
+      const id = `KK-${String(Number(idResult.rows[0]?.max_id || 0) + 1).padStart(6, '0')}`;
+      const createdAt = now();
+      const customer = { ...incoming, id, state: 'Maharashtra', taluka: String(incoming.taluka || ''), ownerId: u.id, createdAt, activityCreatedAt: createdAt };
+
+      await db.query(`
+        INSERT INTO customers
+          (id, first_name, middle_name, last_name, name, mobile, alternate_mobile, reference, address, city, district, pincode, status, created_at, updated_at, data_json)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$14,$15::jsonb)
+      `, [
+        id, customer.firstName || null, customer.middleName || null, customer.lastName || null, customer.name || null,
+        customer.mobile || null, customer.alternateMobile || null, customer.reference || customer.customerReference || null,
+        customer.address || null, customer.city || null, customer.district || null, customer.pincode || null,
+        customer.status || 'ACTIVE', createdAt, JSON.stringify(customer)
+      ]);
+      invalidateNormalizedDataCache();
+      return send(res, 201, { ok: true, customer, user: u });
     } catch (e) {
       console.error('Customer create failed:', e);
       return send(res, 500, { error: e.message || 'Could not save customer' });
     }
-
-    return send(res, 201, { ok: true, customer, user: u });
   }
 
   // Fast, targeted Add to Pending operation. This avoids loading the entire
@@ -2868,6 +2823,7 @@ async function api(req, res) {
       `, [scheduleId, addedAt, u.username || 'admin', updatedJson]);
 
       await client.query('COMMIT');
+      invalidateNormalizedDataCache();
       return send(res, 200, {
         ok: true,
         alreadyPending: false,
@@ -2912,60 +2868,43 @@ async function api(req, res) {
     const client = await db.connect();
     try {
       await client.query('BEGIN');
-      // Keep the shared JSON row only as a lightweight mutation lock. The
-      // actual business snapshot is now read from normalized PostgreSQL tables.
-      await client.query(`SELECT pg_advisory_xact_lock(hashtext('loan-management-shared-data'))`);
-      const data = await loadNormalizedData(client);
 
-      const arrays = new Set(['customers', 'loans', 'schedules', 'payments', 'blacklist', 'notifications', 'deletedRecords', 'expiredCustomers']);
+      // Normal mutations no longer hydrate the entire database or run a full
+      // integrity scan. Each operation is persisted directly to normalized
+      // PostgreSQL tables; FK/NOT NULL constraints remain the final guard.
       for (const op of operations) {
-        if (op.type === 'settings' && op.action === 'replace') {
-          data.settings = { ...blankData().settings, ...(op.record || {}) };
-          continue;
-        }
-        if (op.type === 'pendingQueue' && op.action === 'replace') {
-          data.pendingQueue = Array.isArray(op.records) ? op.records.map(String) : [];
-          continue;
-        }
-        if (!arrays.has(op.type)) continue;
-        const list = data[op.type];
-        const id = String(op.id ?? op.record?.id ?? '');
-        const index = list.findIndex(x => String(x?.id) === id);
-        if (op.action === 'create') {
-          if (index >= 0) { await client.query('ROLLBACK'); return send(res, 409, { error: `${op.type} record already exists: ${id}` }); }
-          if (!op.record || !id) { await client.query('ROLLBACK'); return send(res, 400, { error: `Invalid ${op.type} create operation` }); }
-          list.push(op.record);
-        } else if (op.action === 'update') {
-          if (index < 0) { await client.query('ROLLBACK'); return send(res, 404, { error: `${op.type} record not found: ${id}` }); }
-          if (!op.record) { await client.query('ROLLBACK'); return send(res, 400, { error: `Invalid ${op.type} update operation` }); }
-          list[index] = op.record;
-        } else if (op.action === 'delete') {
-          if (index >= 0) list.splice(index, 1);
+        const action = String(op.action || '');
+        if (['create', 'update'].includes(action)) {
+          const id = String(op.id ?? op.record?.id ?? '');
+          if (!id || !op.record || typeof op.record !== 'object') {
+            await client.query('ROLLBACK');
+            return send(res, 400, { error: `Invalid ${op.type} ${action} operation` });
+          }
         }
       }
 
-      const errors = integrity(data);
-      if (errors.length) {
-        await client.query('ROLLBACK');
-        return send(res, 400, { error: 'Data validation failed', details: errors.slice(0, 20) });
-      }
-
-      const normalized = normalizeData(data);
-      // Persist every mutation to normalized PostgreSQL tables in this transaction.
+      const settingsOp = operations.find(op => op.type === 'settings' && op.action === 'replace');
+      const normalized = {
+        pendingQueue: operations.find(op => op.type === 'pendingQueue' && op.action === 'replace')?.records || [],
+        settings: settingsOp ? { ...blankData().settings, ...(settingsOp.record || {}) } : null
+      };
       await syncNormalizedOperations(client, normalized, operations);
-      await client.query(
-        `INSERT INTO app_settings(id, settings, updated_at)
-         VALUES ($1, $2::jsonb, $3)
-         ON CONFLICT (id) DO UPDATE
-         SET settings = EXCLUDED.settings, updated_at = EXCLUDED.updated_at`,
-        [SHARED_DATA_ID, JSON.stringify(normalized.settings || blankData().settings), now()]
-      );
+      if (settingsOp) {
+        await client.query(
+          `INSERT INTO app_settings(id, settings, updated_at)
+           VALUES ($1, $2::jsonb, $3)
+           ON CONFLICT (id) DO UPDATE
+           SET settings = EXCLUDED.settings, updated_at = EXCLUDED.updated_at`,
+          [SHARED_DATA_ID, JSON.stringify(normalized.settings), now()]
+        );
+      }
       await client.query(
         `INSERT INTO app_meta(key, value) VALUES ($1,$2)
          ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value`,
         ['normalized_data_v1', now()]
       );
       await client.query('COMMIT');
+      invalidateNormalizedDataCache();
       return send(res, 200, { ok: true, applied: operations.length, user: u });
     } catch (e) {
       try { await client.query('ROLLBACK'); } catch { }

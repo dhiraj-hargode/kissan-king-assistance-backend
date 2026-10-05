@@ -2092,8 +2092,8 @@ async function api(req, res) {
         COALESCE(ls.total_loan, 0)::numeric AS total_loan,
         COALESCE(ps.payment_count, 0)::int AS payment_count,
         COALESCE(ss.schedule_count, 0)::int AS schedule_count,
-        blacklist_to_json(b) AS blacklist_json,
-        expired_customer_to_json(e) AS expired_json
+        b.data_json AS blacklist_json,
+        e.data_json AS expired_json
       FROM customers c
       LEFT JOIN (
         SELECT customer_id, COUNT(*)::int AS loan_count, COALESCE(SUM(amount),0)::numeric AS total_loan

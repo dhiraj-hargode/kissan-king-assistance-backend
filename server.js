@@ -1949,10 +1949,16 @@ async function api(req, res) {
 
   if (parts[1] === 'auth') {
     if (method === 'POST' && parts[2] === 'register') {
-      const requester = await sessionUser(req);
       const existing = await countUsers();
-      if (existing === 0 && (!requester || requester.role !== 'Administrator')) {
-        return send(res, 403, { error: 'Only the first account can self-register. An Administrator must create additional users.' });
+
+      if (existing > 0) {
+          const requester = await sessionUser(req);
+
+          if (!requester || requester.role !== 'Administrator') {
+              return send(res, 403, {
+                  error: 'Only an Administrator can create additional users.'
+              });
+          }
       }
 
       const b = await readBody(req);

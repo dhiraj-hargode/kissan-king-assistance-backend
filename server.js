@@ -1600,11 +1600,13 @@ async function api(req, res) {
   const method = req.method || 'GET';
 
   if (method === 'GET' && parts[1] === 'health') {
-  return send(res, 200, {
-    ok: true,
-    service: 'loan-management'
-  });
-}
+    try {
+      await db.query('SELECT 1');
+      return send(res, 200, { ok: true, service: 'loan-management', database: 'PostgreSQL', authentication: 'server' });
+    } catch (e) {
+      return send(res, 503, { ok: false, service: 'loan-management', database: 'PostgreSQL', error: 'Database unavailable' });
+    }
+  }
 
   if (parts[0] !== 'api') return false;
 
@@ -2711,6 +2713,102 @@ async function api(req, res) {
     }
 
     return send(res, 201, { ok: true, customer, user: u });
+  }
+
+  // Fast, targeted Add to Pending operation. This avoids loading the entire
+  // customer/loan/payment/schedule dataset and avoids running a full-dataset
+  // integrity scan for a one-installment queue change.
+  if (method === 'POST' && parts[1] === 'collections' && parts[2] === 'pending' && !parts[3]) {
+    if (!WRITE_ROLES.has(u.role)) return send(res, 403, { error: 'You do not have write permission' });
+
+    let b;
+    try {
+      b = await readBody(req);
+    } catch (e) {
+      return send(res, 400, { error: e.message || 'Invalid request body' });
+    }
+
+    const scheduleId = String(b?.scheduleId || '').trim();
+    if (!scheduleId) return send(res, 400, { error: 'Schedule ID is required' });
+
+    const client = await db.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(`SELECT pg_advisory_xact_lock(hashtext('loan-management-shared-data'))`);
+
+      const scheduleResult = await client.query(`
+        SELECT id, loan_id, due_date, emi, paid, penalty, manual_pending,
+               pending_added_at, pending_added_by, data_json
+        FROM schedules
+        WHERE id = $1
+        FOR UPDATE
+      `, [scheduleId]);
+
+      if (!scheduleResult.rows.length) {
+        await client.query('ROLLBACK');
+        return send(res, 404, { error: 'Installment not found' });
+      }
+
+      const schedule = scheduleResult.rows[0];
+      if (schedule.manual_pending) {
+        await client.query('COMMIT');
+        return send(res, 200, { ok: true, alreadyPending: true, scheduleId });
+      }
+
+      const paymentResult = await client.query(`
+        SELECT
+          COALESCE(SUM(principal + interest), 0)::numeric AS paid_amount,
+          COALESCE(SUM(penalty), 0)::numeric AS paid_penalty
+        FROM payments
+        WHERE schedule_id = $1
+      `, [scheduleId]);
+
+      const paidAmount = Number(paymentResult.rows[0]?.paid_amount || 0);
+      const paidPenalty = Number(paymentResult.rows[0]?.paid_penalty || 0);
+      const scheduled = Math.max(0, Number(schedule.emi || 0));
+      const effectivePaid = Math.max(Number(schedule.paid || 0), paidAmount);
+      const unpaidInstallment = Math.max(0, scheduled - effectivePaid);
+      const unpaidPenalty = Math.max(0, Number(schedule.penalty || 0) - paidPenalty);
+      const pendingAmount = Number((unpaidInstallment + unpaidPenalty).toFixed(2));
+
+      if (pendingAmount <= 0.005) {
+        await client.query('COMMIT');
+        return send(res, 400, { error: 'This installment is already paid.' });
+      }
+
+      const addedAt = now();
+      const updatedJson = JSON.stringify({
+        ...(rowJson(schedule.data_json) || {}),
+        manualPending: true,
+        pendingAddedAt: addedAt,
+        pendingAddedBy: u.username || 'admin'
+      });
+
+      await client.query(`
+        UPDATE schedules
+        SET manual_pending = TRUE,
+            pending_added_at = $2,
+            pending_added_by = $3,
+            data_json = $4::jsonb
+        WHERE id = $1
+      `, [scheduleId, addedAt, u.username || 'admin', updatedJson]);
+
+      await client.query('COMMIT');
+      return send(res, 200, {
+        ok: true,
+        alreadyPending: false,
+        scheduleId,
+        pendingAmount,
+        pendingAddedAt: addedAt,
+        pendingAddedBy: u.username || 'admin'
+      });
+    } catch (e) {
+      try { await client.query('ROLLBACK'); } catch { }
+      console.error('Add to Pending failed:', e);
+      return send(res, 500, { error: e.message || 'Could not add installment to Pending Payments' });
+    } finally {
+      client.release();
+    }
   }
 
   // Targeted mutation API. The browser sends only changed records instead of

@@ -365,9 +365,46 @@ async function initDb() {
     return r.rows[0]?.generated === 's';
   }
 
-  async function backfillColumn(table, column, expression) {
+  async function backfillColumn(table, column, expression, defaultExpression = null) {
     if (await columnIsGenerated(table, column)) return;
+    if (defaultExpression) {
+      await db.query(`ALTER TABLE "${table}" ALTER COLUMN "${column}" SET DEFAULT ${defaultExpression}`);
+    }
     await db.query(`UPDATE "${table}" SET "${column}" = ${expression} WHERE "${column}" IS NULL`);
+  }
+
+  // Repair legacy NOT NULL/default mismatches without touching generated columns.
+  // Existing deployments can have stricter constraints than the current model;
+  // keep those constraints, but make every application-managed optional field safe.
+  async function repairLegacyNulls() {
+    const rules = [
+      ['customers','status',"'ACTIVE'","'ACTIVE'"], ['customers','created_at','NOW()','NOW()'], ['customers','updated_at','NOW()','NOW()'],
+      ['customers','data_json',"'{}'::jsonb","'{}'::jsonb"],
+      ['loans','amount','0','0'], ['loans','rate','0','0'], ['loans','emi','0','0'], ['loans','status',"'ACTIVE'","'ACTIVE'"],
+      ['loans','created_at','NOW()','NOW()'], ['loans','updated_at','NOW()','NOW()'], ['loans','data_json',"'{}'::jsonb","'{}'::jsonb"],
+      ['schedules','emi','0','0'], ['schedules','principal','0','0'], ['schedules','interest','0','0'], ['schedules','penalty','0','0'],
+      ['schedules','paid','0','0'], ['schedules','remaining','0','0'], ['schedules','status',"'PENDING'","'PENDING'"],
+      ['schedules','manual_pending','FALSE','FALSE'], ['schedules','data_json',"'{}'::jsonb","'{}'::jsonb"],
+      ['payments','principal','0','0'], ['payments','interest','0','0'], ['payments','penalty','0','0'],
+      ['payments','created_at','NOW()','NOW()'], ['payments','activity_created_at','NOW()','NOW()'], ['payments','data_json',"'{}'::jsonb","'{}'::jsonb"],
+      ['blacklist','outstanding','0','0'], ['blacklist','created_at','NOW()','NOW()'], ['blacklist','data_json',"'{}'::jsonb","'{}'::jsonb"],
+      ['notifications','read','FALSE','FALSE'], ['notifications','created_at','NOW()','NOW()'], ['notifications','data_json',"'{}'::jsonb","'{}'::jsonb"],
+      ['deleted_records','deleted_at','NOW()','NOW()'], ['deleted_records','data_json',"'{}'::jsonb","'{}'::jsonb"],
+      ['expired_customers','expired_date','CURRENT_DATE','CURRENT_DATE'], ['expired_customers','data_json',"'{}'::jsonb","'{}'::jsonb"]
+    ];
+    for (const [table, column, expr, def] of rules) {
+      const exists = await db.query(`SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name=$1 AND column_name=$2`, [table,column]);
+      if (exists.rows.length && !(await columnIsGenerated(table,column))) {
+        await db.query(`ALTER TABLE "${table}" ALTER COLUMN "${column}" SET DEFAULT ${def}`);
+        await db.query(`UPDATE "${table}" SET "${column}" = ${expr} WHERE "${column}" IS NULL`);
+      }
+    }
+    // Never attempt to update a generated payment.total. If it is an ordinary
+    // column, make it safe for old rows and future inserts.
+    if (!(await columnIsGenerated('payments','total'))) {
+      await db.query(`ALTER TABLE payments ALTER COLUMN total SET DEFAULT 0`);
+      await db.query(`UPDATE payments SET total = COALESCE(principal,0)+COALESCE(interest,0)+COALESCE(penalty,0) WHERE total IS NULL`);
+    }
   }
 
   // Add columns used by the current normalized model when an older database
@@ -433,48 +470,8 @@ async function initDb() {
   await ensureColumn('expired_customers', 'notes', 'TEXT');
   await ensureColumn('expired_customers', 'data_json', "JSONB NOT NULL DEFAULT '{}'::jsonb");
 
-  // Backfill only non-generated columns. In particular, never assign to a
-  // generated payment.total column; PostgreSQL permits only DEFAULT there.
-  await backfillColumn('customers', 'status', "'ACTIVE'");
-  await backfillColumn('customers', 'created_at', 'NOW()');
-  await backfillColumn('customers', 'updated_at', 'NOW()');
-  await backfillColumn('customers', 'data_json', "'{}'::jsonb");
-
-  await backfillColumn('loans', 'amount', '0');
-  await backfillColumn('loans', 'rate', '0');
-  await backfillColumn('loans', 'emi', '0');
-  await backfillColumn('loans', 'status', "'ACTIVE'");
-  await backfillColumn('loans', 'created_at', 'NOW()');
-  await backfillColumn('loans', 'updated_at', 'NOW()');
-  await backfillColumn('loans', 'data_json', "'{}'::jsonb");
-
-  await backfillColumn('schedules', 'emi', '0');
-  await backfillColumn('schedules', 'principal', '0');
-  await backfillColumn('schedules', 'interest', '0');
-  await backfillColumn('schedules', 'penalty', '0');
-  await backfillColumn('schedules', 'paid', '0');
-  await backfillColumn('schedules', 'remaining', '0');
-  await backfillColumn('schedules', 'status', "'PENDING'");
-  await backfillColumn('schedules', 'manual_pending', 'FALSE');
-  await backfillColumn('schedules', 'data_json', "'{}'::jsonb");
-
-  await backfillColumn('payments', 'principal', '0');
-  await backfillColumn('payments', 'interest', '0');
-  await backfillColumn('payments', 'penalty', '0');
-  await backfillColumn('payments', 'total', '0');
-  paymentsTotalGenerated = await columnIsGenerated('payments', 'total');
-  await backfillColumn('payments', 'created_at', 'NOW()');
-  await backfillColumn('payments', 'activity_created_at', 'NOW()');
-  await backfillColumn('payments', 'data_json', "'{}'::jsonb");
-
-  await backfillColumn('blacklist', 'outstanding', '0');
-  await backfillColumn('blacklist', 'created_at', 'NOW()');
-  await backfillColumn('blacklist', 'data_json', "'{}'::jsonb");
-  await backfillColumn('notifications', 'read', 'FALSE');
-  await backfillColumn('notifications', 'created_at', 'NOW()');
-  await backfillColumn('notifications', 'data_json', "'{}'::jsonb");
-  await backfillColumn('deleted_records', 'data_json', "'{}'::jsonb");
-  await backfillColumn('expired_customers', 'data_json', "'{}'::jsonb");
+  // Repair all known legacy NULL/default violations in one idempotent pass.
+  await repairLegacyNulls();
 
   // Older app_settings tables may have used data_json instead of settings.
   await ensureColumn('app_settings', 'settings', "JSONB NOT NULL DEFAULT '{}'::jsonb");
@@ -670,9 +667,9 @@ async function syncNormalizedFull(client, data) {
       COALESCE(NULLIF(src.raw->>'mobile',''), NULLIF(src.raw->>'phone','')),
       COALESCE(NULLIF(src.raw->>'alternateMobile',''), NULLIF(src.raw->>'alternate_mobile','')),
       COALESCE(NULLIF(src.raw->>'reference',''), NULLIF(src.raw->>'customerReference','')),
-      src.raw->>'address', src.raw->>'city', src.raw->>'district', src.raw->>'pincode', src.raw->>'status',
-      NULLIF(COALESCE(src.raw->>'createdAt', src.raw->>'created_at'),'')::timestamptz,
-      NULLIF(COALESCE(src.raw->>'updatedAt', src.raw->>'updated_at'),'')::timestamptz,
+      src.raw->>'address', src.raw->>'city', src.raw->>'district', src.raw->>'pincode', COALESCE(NULLIF(src.raw->>'status',''), 'ACTIVE'),
+      COALESCE(NULLIF(COALESCE(src.raw->>'createdAt', src.raw->>'created_at'), '')::timestamptz, NOW()),
+      COALESCE(NULLIF(COALESCE(src.raw->>'updatedAt', src.raw->>'updated_at'), '')::timestamptz, NOW()),
       src.raw
     FROM jsonb_array_elements($1::jsonb) AS src(raw)
     WHERE NULLIF(src.raw->>'id','') IS NOT NULL
@@ -692,9 +689,9 @@ async function syncNormalizedFull(client, data) {
       COALESCE(NULLIF(src.raw->>'emi','')::numeric, 0),
       COALESCE(NULLIF(src.raw->>'emiOption',''), NULLIF(src.raw->>'emi_option','')),
       NULLIF(COALESCE(src.raw->>'startDate', src.raw->>'start_date'),'')::date,
-      src.raw->>'status',
-      NULLIF(COALESCE(src.raw->>'createdAt', src.raw->>'created_at'),'')::timestamptz,
-      NULLIF(COALESCE(src.raw->>'updatedAt', src.raw->>'updated_at'),'')::timestamptz,
+      COALESCE(NULLIF(src.raw->>'status',''), 'ACTIVE'),
+      COALESCE(NULLIF(COALESCE(src.raw->>'createdAt', src.raw->>'created_at'), '')::timestamptz, NOW()),
+      COALESCE(NULLIF(COALESCE(src.raw->>'updatedAt', src.raw->>'updated_at'), '')::timestamptz, NOW()),
       src.raw
     FROM jsonb_array_elements($1::jsonb) AS src(raw)
     WHERE NULLIF(src.raw->>'id','') IS NOT NULL
@@ -714,7 +711,7 @@ async function syncNormalizedFull(client, data) {
       COALESCE(NULLIF(src.raw->>'penalty','')::numeric, 0),
       COALESCE(NULLIF(src.raw->>'paid','')::numeric, 0),
       COALESCE(NULLIF(src.raw->>'remaining','')::numeric, 0),
-      src.raw->>'status',
+      COALESCE(NULLIF(src.raw->>'status',''), 'PENDING'),
       COALESCE(NULLIF(src.raw->>'manualPending','')::boolean, NULLIF(src.raw->>'manual_pending','')::boolean, false),
       NULLIF(COALESCE(src.raw->>'pendingAddedAt', src.raw->>'pending_added_at'),'')::timestamptz,
       COALESCE(NULLIF(src.raw->>'pendingAddedBy',''), NULLIF(src.raw->>'pending_added_by','')),
@@ -736,8 +733,8 @@ async function syncNormalizedFull(client, data) {
         COALESCE(NULLIF(src.raw->>'interest','')::numeric, 0),
         COALESCE(NULLIF(src.raw->>'penalty','')::numeric, 0),
         src.raw->>'mode', src.raw->>'notes',
-        NULLIF(COALESCE(src.raw->>'createdAt', src.raw->>'created_at'),'')::timestamptz,
-        NULLIF(COALESCE(src.raw->>'activityCreatedAt', src.raw->>'activity_created_at'),'')::timestamptz,
+        COALESCE(NULLIF(COALESCE(src.raw->>'createdAt', src.raw->>'created_at'), '')::timestamptz, NOW()),
+        COALESCE(NULLIF(COALESCE(src.raw->>'activityCreatedAt', src.raw->>'activity_created_at'), '')::timestamptz, NOW()),
         src.raw
       FROM jsonb_array_elements($1::jsonb) AS src(raw)
       WHERE NULLIF(src.raw->>'id','') IS NOT NULL
@@ -756,8 +753,8 @@ async function syncNormalizedFull(client, data) {
         COALESCE(NULLIF(src.raw->>'penalty','')::numeric, 0),
         COALESCE(NULLIF(src.raw->>'total','')::numeric, 0),
         src.raw->>'mode', src.raw->>'notes',
-        NULLIF(COALESCE(src.raw->>'createdAt', src.raw->>'created_at'),'')::timestamptz,
-        NULLIF(COALESCE(src.raw->>'activityCreatedAt', src.raw->>'activity_created_at'),'')::timestamptz,
+        COALESCE(NULLIF(COALESCE(src.raw->>'createdAt', src.raw->>'created_at'), '')::timestamptz, NOW()),
+        COALESCE(NULLIF(COALESCE(src.raw->>'activityCreatedAt', src.raw->>'activity_created_at'), '')::timestamptz, NOW()),
         src.raw
       FROM jsonb_array_elements($1::jsonb) AS src(raw)
       WHERE NULLIF(src.raw->>'id','') IS NOT NULL
@@ -856,8 +853,8 @@ async function syncNormalizedOperations(client, data, operations) {
     `, [
       c.id, c.firstName || null, c.middleName || null, c.lastName || null, c.name || null,
       c.mobile || c.phone || null, c.alternateMobile || null, c.reference || c.customerReference || null,
-      c.address || null, c.city || null, c.district || null, c.pincode || null, c.status || null,
-      c.createdAt || null, c.updatedAt || null, JSON.stringify(c)
+      c.address || null, c.city || null, c.district || null, c.pincode || null, c.status || 'ACTIVE',
+      c.createdAt || now(), c.updatedAt || c.createdAt || now(), JSON.stringify(c)
     ]);
   }
 
@@ -874,7 +871,7 @@ async function syncNormalizedOperations(client, data, operations) {
     `, [
       l.id, l.customerId, l.khataNo || l.legacyKhataNo || null, l.loanType || null, l.loanAgainst || null,
       Number(l.amount || 0), Number(l.interestRate ?? l.rate ?? 0), Number(l.emi || 0), l.emiOption || null,
-      l.startDate || null, l.status || null, l.createdAt || null, l.updatedAt || null, JSON.stringify(l)
+      l.startDate || null, l.status || 'ACTIVE', l.createdAt || now(), l.updatedAt || l.createdAt || now(), JSON.stringify(l)
     ]);
   }
 
@@ -891,7 +888,7 @@ async function syncNormalizedOperations(client, data, operations) {
     `, [
       sc.id, sc.loanId, sc.dueDate || null, sc.installment ?? sc.installmentNo ?? null, Number(sc.emi || 0),
       Number(sc.principal || 0), Number(sc.interest || 0), Number(sc.penalty || 0), Number(sc.paid || 0),
-      Number(sc.remaining || 0), sc.status || null, Boolean(sc.manualPending), sc.pendingAddedAt || null,
+      Number(sc.remaining || 0), sc.status || 'PENDING', Boolean(sc.manualPending), sc.pendingAddedAt || null,
       sc.pendingAddedBy || null, JSON.stringify(sc)
     ]);
   }
@@ -2852,7 +2849,9 @@ async function api(req, res) {
       state: 'Maharashtra',
       taluka: String(incoming.taluka || ''),
       ownerId: u.id,
+      status: String(incoming.status || 'ACTIVE'),
       createdAt,
+      updatedAt: createdAt,
       activityCreatedAt: createdAt
     };
 

@@ -1602,34 +1602,6 @@ function buildDashboardData(data, asOf, range = '6m') {
 }
 
 
-async function normalizedMigrationStatus() {
-  const meta = await db.query('SELECT value FROM app_meta WHERE key = $1', ['normalized_data_v1']);
-  const counts = await db.query(`
-    SELECT
-      (SELECT COUNT(*)::int FROM customers) AS customers,
-      (SELECT COUNT(*)::int FROM loans) AS loans,
-      (SELECT COUNT(*)::int FROM schedules) AS schedules,
-      (SELECT COUNT(*)::int FROM payments) AS payments,
-      (SELECT COUNT(*)::int FROM blacklist) AS blacklist,
-      (SELECT COUNT(*)::int FROM notifications) AS notifications,
-      (SELECT COUNT(*)::int FROM expired_customers) AS expired_customers
-  `);
-  return { source: meta.rows[0] ? 'normalized_postgresql' : 'not_migrated', legacyMirror: false, migratedAt: meta.rows[0]?.value || null, counts: counts.rows[0] || {} };
-}
-
-async function migrateJsonToNormalized() {
-  const status = await normalizedMigrationStatus();
-  if (status.source === 'normalized_postgresql') {
-    return {
-      alreadyMigrated: true,
-      message: 'Normalized PostgreSQL is already active. No migration was performed.',
-      counts: status.counts,
-      migratedAt: status.migratedAt
-    };
-  }
-  throw new Error('Legacy JSON migration is no longer available because the legacy user_data table has been retired. Restore a pre-migration backup before attempting a legacy migration.');
-}
-
 async function api(req, res) {
   const parts = pathParts(req.url);
   const method = req.method || 'GET';
@@ -2582,27 +2554,6 @@ async function api(req, res) {
     }
   }
 
-  if (method === 'GET' && parts[1] === 'admin' && parts[2] === 'normalized-status' && !parts[3]) {
-    const u = await sessionUser(req);
-    if (!u) return send(res, 401, { error: 'Authentication required' });
-    if (!ADMIN_ROLES.has(u.role)) return send(res, 403, { error: 'Administrator permission required' });
-    return send(res, 200, await normalizedMigrationStatus());
-  }
-
-  if (method === 'POST' && parts[1] === 'admin' && parts[2] === 'migrate-normalized' && !parts[3]) {
-    const u = await sessionUser(req);
-    if (!u) return send(res, 401, { error: 'Authentication required' });
-    if (!ADMIN_ROLES.has(u.role)) return send(res, 403, { error: 'Administrator permission required' });
-    const b = await readBody(req);
-    if (b.confirm !== 'MIGRATE') return send(res, 400, { error: 'Type MIGRATE to confirm normalized database migration.' });
-    try {
-      const result = await migrateJsonToNormalized();
-      return send(res, 200, { ok: true, ...result, source: 'normalized_postgresql' });
-    } catch (e) {
-      console.error('Normalized migration failed:', e);
-      return send(res, 400, { error: e.message || 'Normalized migration failed', details: e.details || [] });
-    }
-  }
 
   const u = await sessionUser(req);
   if (!u) return send(res, 401, { error: 'Authentication required' });

@@ -337,14 +337,6 @@ async function initDb() {
     )
   `);
 
-  // Backward-compatible schema repair for databases created by older builds.
-  // CREATE TABLE IF NOT EXISTS does not add columns to an existing table.
-  // The normalized loader requires data_json on every business table.
-  for (const table of ['customers','loans','schedules','payments','blacklist','notifications','deleted_records','expired_customers']) {
-    await db.query(`ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS data_json JSONB NOT NULL DEFAULT '{}'::jsonb`);
-  }
-  await db.query(`ALTER TABLE app_settings ADD COLUMN IF NOT EXISTS settings JSONB NOT NULL DEFAULT '{}'::jsonb`);
-
   await db.query('CREATE INDEX IF NOT EXISTS idx_customers_name ON customers(name, first_name, last_name)');
   await db.query('CREATE INDEX IF NOT EXISTS idx_customers_mobile ON customers(mobile)');
   await db.query('CREATE INDEX IF NOT EXISTS idx_customers_city ON customers(city)');
@@ -2707,6 +2699,10 @@ async function api(req, res) {
       id,
       state: 'Maharashtra',
       taluka: String(incoming.taluka || ''),
+      // Normalized PostgreSQL requires a non-null customer status.
+      // Keep the frontend payload unchanged while ensuring every new customer
+      // has the same active status expected by the normalized schema.
+      status: String(incoming.status || 'ACTIVE').trim().toUpperCase(),
       ownerId: u.id,
       createdAt,
       activityCreatedAt: createdAt

@@ -13,7 +13,6 @@ const IS_PROD = process.env.NODE_ENV === 'production';
 const ROOT = __dirname;
 const DATA_DIR = path.join(ROOT, 'data');
 const BACKUP_DIR = path.join(ROOT, 'backups');
-fs.mkdirSync(DATA_DIR, { recursive: true });
 fs.mkdirSync(BACKUP_DIR, { recursive: true });
 
 if (!process.env.DATABASE_URL) {
@@ -233,216 +232,8 @@ function changes(before, after) {
 }
 
 // PostgreSQL database schema.
-async function initDb() {
-  // Clean relational PostgreSQL schema. Business data is stored only in
-  // typed PostgreSQL columns only; no legacy JSON business store.
-  await db.query(`
-    CREATE TABLE IF NOT EXISTS users (
-      id TEXT PRIMARY KEY,
-      name TEXT NOT NULL,
-      username TEXT UNIQUE NOT NULL,
-      mobile TEXT,
-      role TEXT NOT NULL,
-      password_hash TEXT NOT NULL,
-      active BOOLEAN NOT NULL DEFAULT TRUE,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-
-    CREATE TABLE IF NOT EXISTS sessions (
-      id TEXT PRIMARY KEY,
-      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      token_hash TEXT UNIQUE NOT NULL,
-      expires_at TIMESTAMPTZ NOT NULL,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-
-    CREATE TABLE IF NOT EXISTS app_settings (
-      id TEXT PRIMARY KEY,
-      app_name TEXT NOT NULL DEFAULT 'Kissan-King Assistance',
-      currency TEXT NOT NULL DEFAULT 'INR',
-      default_interest NUMERIC(10,4) NOT NULL DEFAULT 2,
-      default_penalty NUMERIC(18,2) NOT NULL DEFAULT 0,
-      reminder_days INTEGER[] NOT NULL DEFAULT ARRAY[7,3,1,0],
-      logo_data TEXT NOT NULL DEFAULT '',
-      logo_enabled BOOLEAN NOT NULL DEFAULT TRUE,
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-
-    CREATE TABLE IF NOT EXISTS app_backups (
-      id BIGSERIAL PRIMARY KEY,
-      file_name TEXT NOT NULL,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      size_bytes BIGINT
-    );
-
-    CREATE TABLE IF NOT EXISTS app_meta (
-      key TEXT PRIMARY KEY,
-      value TEXT NOT NULL,
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-
-    CREATE TABLE IF NOT EXISTS customers (
-      id TEXT PRIMARY KEY,
-      first_name TEXT NOT NULL,
-      middle_name TEXT,
-      last_name TEXT,
-      name TEXT,
-      mobile TEXT NOT NULL UNIQUE,
-      home_number TEXT,
-      alternate_mobile TEXT,
-      reference TEXT,
-      address TEXT,
-      city TEXT,
-      taluka TEXT,
-      district TEXT,
-      state TEXT,
-      pincode TEXT,
-      status TEXT NOT NULL DEFAULT 'ACTIVE',
-      notes TEXT,
-      owner_id TEXT REFERENCES users(id) ON DELETE SET NULL,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      activity_created_at TIMESTAMPTZ
-    );
-
-    CREATE TABLE IF NOT EXISTS guarantors (
-      id BIGSERIAL PRIMARY KEY,
-      customer_id TEXT NOT NULL UNIQUE REFERENCES customers(id) ON DELETE CASCADE,
-      name TEXT,
-      mobile TEXT,
-      relation TEXT,
-      address TEXT,
-      notes TEXT,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-
-    CREATE TABLE IF NOT EXISTS loans (
-      id TEXT PRIMARY KEY,
-      customer_id TEXT NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
-      khata_no TEXT,
-      legacy_khata_no TEXT,
-      loan_type TEXT,
-      loan_against TEXT,
-      amount NUMERIC(18,2) NOT NULL DEFAULT 0,
-      rate NUMERIC(10,4) NOT NULL DEFAULT 0,
-      emi NUMERIC(18,2) NOT NULL DEFAULT 0,
-      emi_option TEXT,
-      start_date DATE,
-      due_day INTEGER,
-      duration INTEGER,
-      status TEXT NOT NULL DEFAULT 'ACTIVE',
-      notes TEXT,
-      owner_id TEXT REFERENCES users(id) ON DELETE SET NULL,
-      completed_at DATE,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-
-    CREATE TABLE IF NOT EXISTS schedules (
-      id TEXT PRIMARY KEY,
-      loan_id TEXT NOT NULL REFERENCES loans(id) ON DELETE CASCADE,
-      due_date DATE NOT NULL,
-      installment_no INTEGER NOT NULL,
-      emi NUMERIC(18,2) NOT NULL DEFAULT 0,
-      principal NUMERIC(18,2) NOT NULL DEFAULT 0,
-      interest NUMERIC(18,2) NOT NULL DEFAULT 0,
-      penalty NUMERIC(18,2) NOT NULL DEFAULT 0,
-      status TEXT NOT NULL DEFAULT 'PENDING',
-      manual_pending BOOLEAN NOT NULL DEFAULT FALSE,
-      pending_added_at TIMESTAMPTZ,
-      pending_added_by TEXT,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      UNIQUE (loan_id, installment_no)
-    );
-
-    CREATE TABLE IF NOT EXISTS payments (
-      id TEXT PRIMARY KEY,
-      loan_id TEXT NOT NULL REFERENCES loans(id) ON DELETE RESTRICT,
-      schedule_id TEXT REFERENCES schedules(id) ON DELETE RESTRICT,
-      payment_date DATE NOT NULL,
-      principal NUMERIC(18,2) NOT NULL DEFAULT 0,
-      interest NUMERIC(18,2) NOT NULL DEFAULT 0,
-      penalty NUMERIC(18,2) NOT NULL DEFAULT 0,
-      total NUMERIC(18,2) GENERATED ALWAYS AS (principal + interest + penalty) STORED,
-      mode TEXT,
-      notes TEXT,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      activity_created_at TIMESTAMPTZ
-    );
-
-    CREATE TABLE IF NOT EXISTS blacklist (
-      id TEXT PRIMARY KEY,
-      customer_id TEXT NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
-      reason TEXT,
-      blacklist_date DATE,
-      notes TEXT,
-      outstanding NUMERIC(18,2) NOT NULL DEFAULT 0,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-
-    CREATE TABLE IF NOT EXISTS notifications (
-      id TEXT PRIMARY KEY,
-      customer_id TEXT REFERENCES customers(id) ON DELETE CASCADE,
-      type TEXT,
-      title TEXT,
-      message TEXT,
-      read BOOLEAN NOT NULL DEFAULT FALSE,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      read_at TIMESTAMPTZ
-    );
-
-    CREATE TABLE IF NOT EXISTS deleted_records (
-      id TEXT PRIMARY KEY,
-      record_type TEXT NOT NULL,
-      record_id TEXT NOT NULL,
-      deleted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      deleted_by TEXT,
-      summary TEXT
-    );
-
-    CREATE TABLE IF NOT EXISTS expired_customers (
-      id TEXT PRIMARY KEY,
-      customer_id TEXT NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
-      reason TEXT,
-      expired_date DATE,
-      notes TEXT,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_customers_name ON customers(first_name, last_name, name);
-    CREATE INDEX IF NOT EXISTS idx_customers_mobile ON customers(mobile);
-    CREATE INDEX IF NOT EXISTS idx_customers_city ON customers(city);
-    CREATE INDEX IF NOT EXISTS idx_customers_status ON customers(status);
-    CREATE INDEX IF NOT EXISTS idx_loans_customer_id ON loans(customer_id);
-    CREATE INDEX IF NOT EXISTS idx_loans_khata_no ON loans(khata_no);
-    CREATE INDEX IF NOT EXISTS idx_loans_status ON loans(status);
-    CREATE INDEX IF NOT EXISTS idx_loans_start_date ON loans(start_date);
-    CREATE INDEX IF NOT EXISTS idx_schedules_loan_id ON schedules(loan_id);
-    CREATE INDEX IF NOT EXISTS idx_schedules_due_date ON schedules(due_date);
-    CREATE INDEX IF NOT EXISTS idx_schedules_pending ON schedules(due_date) WHERE manual_pending = TRUE;
-    CREATE INDEX IF NOT EXISTS idx_schedules_loan_due ON schedules(loan_id, due_date, installment_no);
-    CREATE INDEX IF NOT EXISTS idx_payments_loan_date ON payments(loan_id, payment_date DESC);
-    CREATE INDEX IF NOT EXISTS idx_payments_schedule_date ON payments(schedule_id, payment_date DESC);
-    CREATE INDEX IF NOT EXISTS idx_payments_date ON payments(payment_date);
-    CREATE INDEX IF NOT EXISTS idx_blacklist_customer ON blacklist(customer_id);
-    CREATE INDEX IF NOT EXISTS idx_expired_customer ON expired_customers(customer_id);
-    CREATE INDEX IF NOT EXISTS idx_notifications_customer_read ON notifications(customer_id, read);
-    CREATE INDEX IF NOT EXISTS idx_sessions_token_hash ON sessions(token_hash);
-    CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id);
-    CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
-  `);
-
-  await db.query(`
-    INSERT INTO app_settings(id)
-    VALUES ($1)
-    ON CONFLICT (id) DO NOTHING
-  `, [SHARED_DATA_ID]);
-
-  console.log('Clean relational PostgreSQL schema initialized successfully.');
-}
-
-const SHARED_DATA_ID = '__SHARED__';
+// Database schema is managed explicitly through database/schema.sql or
+// database/reset-and-create.sql. The application does NOT run DDL during startup.
 
 function mergeDataSets(items) {
   const out = blankData();
@@ -2710,10 +2501,11 @@ const server = http.createServer(async (req, res) => {
 
 async function start() {
   try {
-    await db.query('SELECT NOW()');
+    await db.query('SELECT 1');
     console.log('PostgreSQL connection successful.');
-    await initDb();
 
+    // Render health checks must not wait for schema creation or migrations.
+    // The schema is installed separately through database/schema.sql.
     server.listen(PORT, HOST, () => {
       console.log(`Kissan-King Assistance server running at http://${HOST}:${PORT}`);
     });

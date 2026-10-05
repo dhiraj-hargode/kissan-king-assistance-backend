@@ -218,6 +218,51 @@ function changes(before, after) {
     .flatMap(k => diff(before, after, k).map(([action, id]) => ({ action, type: k, id })));
 }
 
+// Final PostgreSQL-only schema helpers. Core business data is stored in relational
+// columns. JSONB is used only for application configuration and deleted-record snapshots.
+async function finalizePostgresSchema() {
+  const tables = ['customers','loans','schedules','payments','blacklist','notifications','deleted_records','expired_customers'];
+  await db.query(`ALTER TABLE customers ADD COLUMN IF NOT EXISTS alternate_mobile TEXT, ADD COLUMN IF NOT EXISTS reference TEXT, ADD COLUMN IF NOT EXISTS address TEXT, ADD COLUMN IF NOT EXISTS city TEXT, ADD COLUMN IF NOT EXISTS district TEXT, ADD COLUMN IF NOT EXISTS pincode TEXT, ADD COLUMN IF NOT EXISTS status TEXT, ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ, ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ, ADD COLUMN IF NOT EXISTS name TEXT`);
+  await db.query(`ALTER TABLE loans ADD COLUMN IF NOT EXISTS legacy_khata_no TEXT, ADD COLUMN IF NOT EXISTS duration_months INTEGER, ADD COLUMN IF NOT EXISTS due_day INTEGER, ADD COLUMN IF NOT EXISTS interest_method TEXT, ADD COLUMN IF NOT EXISTS penalty_per_installment NUMERIC(18,2) DEFAULT 0, ADD COLUMN IF NOT EXISTS notes TEXT`);
+  await db.query(`CREATE TABLE IF NOT EXISTS customer_guarantors (id TEXT PRIMARY KEY, customer_id TEXT NOT NULL REFERENCES customers(id) ON DELETE CASCADE, name TEXT NOT NULL, mobile TEXT, address TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
+  await db.query(`CREATE INDEX IF NOT EXISTS idx_customer_guarantors_customer ON customer_guarantors(customer_id)`);
+
+  const legacy = await db.query(`SELECT to_regclass('public.customers') IS NOT NULL AND EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='customers' AND column_name='data_json') AS has_json`);
+  if (legacy.rows[0]?.has_json) {
+    await db.query(`UPDATE customers SET name=COALESCE(NULLIF(name,''),NULLIF(data_json->>'name','')), first_name=COALESCE(NULLIF(first_name,''),NULLIF(data_json->>'firstName','')), middle_name=COALESCE(NULLIF(middle_name,''),NULLIF(data_json->>'middleName','')), last_name=COALESCE(NULLIF(last_name,''),NULLIF(data_json->>'lastName','')), mobile=COALESCE(NULLIF(mobile,''),NULLIF(data_json->>'mobile',''),NULLIF(data_json->>'phone','')), alternate_mobile=COALESCE(NULLIF(alternate_mobile,''),NULLIF(data_json->>'alternateMobile','')), reference=COALESCE(NULLIF(reference,''),NULLIF(data_json->>'reference',''),NULLIF(data_json->>'customerReference','')), address=COALESCE(NULLIF(address,''),NULLIF(data_json->>'address','')), city=COALESCE(NULLIF(city,''),NULLIF(data_json->>'city','')), district=COALESCE(NULLIF(district,''),NULLIF(data_json->>'district','')), pincode=COALESCE(NULLIF(pincode,''),NULLIF(data_json->>'pincode','')), status=COALESCE(NULLIF(status,''),NULLIF(data_json->>'status','')), created_at=COALESCE(created_at,NULLIF(COALESCE(data_json->>'createdAt',data_json->>'created_at'),'')::timestamptz), updated_at=COALESCE(updated_at,NULLIF(COALESCE(data_json->>'updatedAt',data_json->>'updated_at'),'')::timestamptz)`);
+    await db.query(`INSERT INTO customer_guarantors(id,customer_id,name,mobile,address) SELECT 'G-'||c.id,c.id,c.data_json->>'guarantorName',c.data_json->>'guarantorMobile',c.data_json->>'guarantorAddress' FROM customers c WHERE NULLIF(c.data_json->>'guarantorName','') IS NOT NULL ON CONFLICT(id) DO UPDATE SET name=EXCLUDED.name,mobile=EXCLUDED.mobile,address=EXCLUDED.address`);
+  }
+  const loanLegacy = await db.query(`SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='loans' AND column_name='data_json') AS has_json`);
+  if (loanLegacy.rows[0]?.has_json) await db.query(`UPDATE loans SET legacy_khata_no=COALESCE(NULLIF(legacy_khata_no,''),NULLIF(data_json->>'legacyKhataNo','')), duration_months=COALESCE(duration_months,NULLIF(COALESCE(data_json->>'duration',data_json->>'durationMonths'),'')::int), due_day=COALESCE(due_day,NULLIF(data_json->>'dueDay','')::int), interest_method=COALESCE(NULLIF(interest_method,''),NULLIF(data_json->>'method',''),NULLIF(data_json->>'interestMethod','')), penalty_per_installment=COALESCE(penalty_per_installment,NULLIF(COALESCE(data_json->>'penalty',data_json->>'penaltyPerInstallment'),'')::numeric,0), notes=COALESCE(notes,data_json->>'notes')`);
+  await db.query(`ALTER TABLE deleted_records ADD COLUMN IF NOT EXISTS snapshot_json JSONB`);
+  const delLegacy = await db.query(`SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='deleted_records' AND column_name='data_json') AS has_json`);
+  if (delLegacy.rows[0]?.has_json) await db.query(`UPDATE deleted_records SET snapshot_json=COALESCE(snapshot_json,data_json)`);
+  // The application now reads/writes only relational PostgreSQL columns. Dropping the
+  // old compatibility columns is deliberately gated so production data can be backed
+  // up before the final destructive cleanup. Set FINALIZE_POSTGRES_SCHEMA=true once.
+  if (String(process.env.FINALIZE_POSTGRES_SCHEMA || '').toLowerCase() === 'true') {
+    await db.query(`ALTER TABLE customers DROP COLUMN IF EXISTS data_json`);
+    await db.query(`ALTER TABLE loans DROP COLUMN IF EXISTS data_json`);
+    await db.query(`ALTER TABLE schedules DROP COLUMN IF EXISTS data_json`);
+    await db.query(`ALTER TABLE payments DROP COLUMN IF EXISTS data_json`);
+    await db.query(`ALTER TABLE blacklist DROP COLUMN IF EXISTS data_json`);
+    await db.query(`ALTER TABLE notifications DROP COLUMN IF EXISTS data_json`);
+    await db.query(`ALTER TABLE deleted_records DROP COLUMN IF EXISTS data_json`);
+    await db.query(`ALTER TABLE expired_customers DROP COLUMN IF EXISTS data_json`);
+    console.log('PostgreSQL-only schema finalized: legacy JSON columns removed.');
+  }
+
+  // Read compatibility is computed from relational columns; nothing is persisted as JSON.
+  await db.query(`CREATE OR REPLACE FUNCTION customer_to_json(c customers) RETURNS jsonb LANGUAGE SQL STABLE AS $$ SELECT jsonb_build_object('id',c.id,'firstName',c.first_name,'middleName',c.middle_name,'lastName',c.last_name,'name',c.name,'mobile',c.mobile,'alternateMobile',c.alternate_mobile,'reference',c.reference,'address',c.address,'city',c.city,'district',c.district,'pincode',c.pincode,'status',c.status,'createdAt',c.created_at,'updatedAt',c.updated_at,'guarantorName',(SELECT g.name FROM customer_guarantors g WHERE g.customer_id=c.id ORDER BY g.created_at DESC LIMIT 1),'guarantorMobile',(SELECT g.mobile FROM customer_guarantors g WHERE g.customer_id=c.id ORDER BY g.created_at DESC LIMIT 1),'guarantorAddress',(SELECT g.address FROM customer_guarantors g WHERE g.customer_id=c.id ORDER BY g.created_at DESC LIMIT 1)) $$`);
+  await db.query(`CREATE OR REPLACE FUNCTION loan_to_json(l loans) RETURNS jsonb LANGUAGE SQL STABLE AS $$ SELECT jsonb_build_object('id',l.id,'customerId',l.customer_id,'khataNo',l.khata_no,'legacyKhataNo',l.legacy_khata_no,'loanType',l.loan_type,'loanAgainst',l.loan_against,'amount',l.amount,'interestRate',l.rate,'emi',l.emi,'emiOption',l.emi_option,'startDate',l.start_date,'duration',l.duration_months,'durationMonths',l.duration_months,'dueDay',l.due_day,'method',l.interest_method,'interestMethod',l.interest_method,'penalty',l.penalty_per_installment,'notes',l.notes,'status',l.status,'createdAt',l.created_at,'updatedAt',l.updated_at) $$`);
+  await db.query(`CREATE OR REPLACE FUNCTION schedule_to_json(s schedules) RETURNS jsonb LANGUAGE SQL STABLE AS $$ SELECT jsonb_build_object('id',s.id,'loanId',s.loan_id,'dueDate',s.due_date,'installment',s.installment_no,'installmentNo',s.installment_no,'emi',s.emi,'principal',s.principal,'interest',s.interest,'penalty',s.penalty,'paid',s.paid,'remaining',s.remaining,'status',s.status,'manualPending',s.manual_pending,'pendingAddedAt',s.pending_added_at,'pendingAddedBy',s.pending_added_by) $$`);
+  await db.query(`CREATE OR REPLACE FUNCTION payment_to_json(p payments) RETURNS jsonb LANGUAGE SQL STABLE AS $$ SELECT jsonb_build_object('id',p.id,'loanId',p.loan_id,'scheduleId',p.schedule_id,'date',p.payment_date,'paymentDate',p.payment_date,'principal',p.principal,'interest',p.interest,'penalty',p.penalty,'total',p.total,'mode',p.mode,'notes',p.notes,'createdAt',p.created_at,'activityCreatedAt',p.activity_created_at) $$`);
+  await db.query(`CREATE OR REPLACE FUNCTION blacklist_to_json(b blacklist) RETURNS jsonb LANGUAGE SQL STABLE AS $$ SELECT jsonb_build_object('id',b.id,'customerId',b.customer_id,'reason',b.reason,'date',b.blacklist_date,'blacklistDate',b.blacklist_date,'notes',b.notes,'outstanding',b.outstanding,'createdAt',b.created_at) $$`);
+  await db.query(`CREATE OR REPLACE FUNCTION notification_to_json(n notifications) RETURNS jsonb LANGUAGE SQL STABLE AS $$ SELECT jsonb_build_object('id',n.id,'customerId',n.customer_id,'type',n.type,'title',n.title,'message',n.message,'read',n.read,'createdAt',n.created_at) $$`);
+  await db.query(`CREATE OR REPLACE FUNCTION deleted_record_to_json(d deleted_records) RETURNS jsonb LANGUAGE SQL STABLE AS $$ SELECT COALESCE(d.snapshot_json,jsonb_build_object('id',d.id,'recordType',d.record_type,'recordId',d.record_id,'deletedAt',d.deleted_at,'deletedBy',d.deleted_by)) $$`);
+  await db.query(`CREATE OR REPLACE FUNCTION expired_customer_to_json(e expired_customers) RETURNS jsonb LANGUAGE SQL STABLE AS $$ SELECT jsonb_build_object('id',e.id,'customerId',e.customer_id,'reason',e.reason,'date',e.expired_date,'expiredDate',e.expired_date,'notes',e.notes) $$`);
+}
+
 // PostgreSQL database schema.
 async function initDb() {
   await db.query(`
@@ -275,17 +320,19 @@ async function initDb() {
       first_name TEXT, middle_name TEXT, last_name TEXT, name TEXT,
       mobile TEXT, alternate_mobile TEXT, reference TEXT, address TEXT,
       city TEXT, district TEXT, pincode TEXT, status TEXT,
-      created_at TIMESTAMPTZ, updated_at TIMESTAMPTZ, data_json JSONB NOT NULL DEFAULT '{}'::jsonb
+      created_at TIMESTAMPTZ, updated_at TIMESTAMPTZ
     )
   `);
   await db.query(`
     CREATE TABLE IF NOT EXISTS loans (
       id TEXT PRIMARY KEY,
       customer_id TEXT NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
-      khata_no TEXT, loan_type TEXT, loan_against TEXT,
+      khata_no TEXT, legacy_khata_no TEXT, loan_type TEXT, loan_against TEXT,
       amount NUMERIC(18,2) NOT NULL DEFAULT 0, rate NUMERIC(10,4) DEFAULT 0,
       emi NUMERIC(18,2) DEFAULT 0, emi_option TEXT, start_date DATE,
-      status TEXT, created_at TIMESTAMPTZ, updated_at TIMESTAMPTZ, data_json JSONB NOT NULL DEFAULT '{}'::jsonb
+      duration_months INTEGER, due_day INTEGER, interest_method TEXT,
+      penalty_per_installment NUMERIC(18,2) DEFAULT 0, notes TEXT,
+      status TEXT, created_at TIMESTAMPTZ, updated_at TIMESTAMPTZ
     )
   `);
   await db.query(`
@@ -296,7 +343,7 @@ async function initDb() {
       principal NUMERIC(18,2) DEFAULT 0, interest NUMERIC(18,2) DEFAULT 0,
       penalty NUMERIC(18,2) DEFAULT 0, paid NUMERIC(18,2) DEFAULT 0,
       remaining NUMERIC(18,2) DEFAULT 0, status TEXT, manual_pending BOOLEAN DEFAULT FALSE,
-      pending_added_at TIMESTAMPTZ, pending_added_by TEXT, data_json JSONB NOT NULL DEFAULT '{}'::jsonb
+      pending_added_at TIMESTAMPTZ, pending_added_by TEXT
     )
   `);
   await db.query(`
@@ -307,35 +354,37 @@ async function initDb() {
       payment_date DATE, principal NUMERIC(18,2) DEFAULT 0,
       interest NUMERIC(18,2) DEFAULT 0, penalty NUMERIC(18,2) DEFAULT 0,
       total NUMERIC(18,2) DEFAULT 0, mode TEXT, notes TEXT,
-      created_at TIMESTAMPTZ, activity_created_at TIMESTAMPTZ, data_json JSONB NOT NULL DEFAULT '{}'::jsonb
+      created_at TIMESTAMPTZ, activity_created_at TIMESTAMPTZ
     )
   `);
   await db.query(`
     CREATE TABLE IF NOT EXISTS blacklist (
       id TEXT PRIMARY KEY, customer_id TEXT NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
       reason TEXT, blacklist_date DATE, notes TEXT, outstanding NUMERIC(18,2) DEFAULT 0,
-      created_at TIMESTAMPTZ, data_json JSONB NOT NULL DEFAULT '{}'::jsonb
+      created_at TIMESTAMPTZ
     )
   `);
   await db.query(`
     CREATE TABLE IF NOT EXISTS notifications (
       id TEXT PRIMARY KEY, customer_id TEXT REFERENCES customers(id) ON DELETE CASCADE,
       type TEXT, title TEXT, message TEXT, read BOOLEAN DEFAULT FALSE,
-      created_at TIMESTAMPTZ, data_json JSONB NOT NULL DEFAULT '{}'::jsonb
+      created_at TIMESTAMPTZ
     )
   `);
   await db.query(`
     CREATE TABLE IF NOT EXISTS deleted_records (
       id TEXT PRIMARY KEY, record_type TEXT, record_id TEXT,
-      deleted_at TIMESTAMPTZ, deleted_by TEXT, data_json JSONB NOT NULL DEFAULT '{}'::jsonb
+      deleted_at TIMESTAMPTZ, deleted_by TEXT, snapshot_json JSONB
     )
   `);
   await db.query(`
     CREATE TABLE IF NOT EXISTS expired_customers (
       id TEXT PRIMARY KEY, customer_id TEXT NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
-      reason TEXT, expired_date DATE, notes TEXT, data_json JSONB NOT NULL DEFAULT '{}'::jsonb
+      reason TEXT, expired_date DATE, notes TEXT
     )
   `);
+
+  await finalizePostgresSchema();
 
   await db.query('CREATE INDEX IF NOT EXISTS idx_customers_name ON customers(name, first_name, last_name)');
   await db.query('CREATE INDEX IF NOT EXISTS idx_customers_mobile ON customers(mobile)');
@@ -465,14 +514,14 @@ function rowJson(value) {
 
 async function loadNormalizedData(executor = db) {
   const [customersR, loansR, schedulesR, paymentsR, blacklistR, notificationsR, deletedR, expiredR, settingsR] = await Promise.all([
-    executor.query('SELECT data_json FROM customers ORDER BY id'),
-    executor.query('SELECT data_json FROM loans ORDER BY id'),
-    executor.query('SELECT data_json, manual_pending, pending_added_at, pending_added_by FROM schedules ORDER BY due_date NULLS LAST, id'),
-    executor.query('SELECT data_json FROM payments ORDER BY payment_date DESC NULLS LAST, id DESC'),
-    executor.query('SELECT data_json FROM blacklist ORDER BY blacklist_date DESC NULLS LAST, id DESC'),
-    executor.query('SELECT data_json FROM notifications ORDER BY created_at DESC NULLS LAST, id DESC'),
-    executor.query('SELECT data_json FROM deleted_records ORDER BY deleted_at DESC NULLS LAST, id DESC'),
-    executor.query('SELECT data_json FROM expired_customers ORDER BY expired_date DESC NULLS LAST, id DESC'),
+    executor.query('SELECT customer_to_json(c) AS data_json FROM customers c ORDER BY c.id'),
+    executor.query('SELECT loan_to_json(l) AS data_json FROM loans l ORDER BY l.id'),
+    executor.query('SELECT schedule_to_json(s) AS data_json, s.manual_pending, s.pending_added_at, s.pending_added_by FROM schedules s ORDER BY s.due_date NULLS LAST, s.id'),
+    executor.query('SELECT payment_to_json(p) AS data_json FROM payments p ORDER BY p.payment_date DESC NULLS LAST, p.id DESC'),
+    executor.query('SELECT blacklist_to_json(b) AS data_json FROM blacklist b ORDER BY b.blacklist_date DESC NULLS LAST, b.id DESC'),
+    executor.query('SELECT notification_to_json(n) AS data_json FROM notifications n ORDER BY n.created_at DESC NULLS LAST, n.id DESC'),
+    executor.query('SELECT deleted_record_to_json(d) AS data_json FROM deleted_records d ORDER BY d.deleted_at DESC NULLS LAST, d.id DESC'),
+    executor.query('SELECT expired_customer_to_json(e) AS data_json FROM expired_customers e ORDER BY e.expired_date DESC NULLS LAST, e.id DESC'),
     executor.query(`SELECT COALESCE(settings, '{}'::jsonb) AS settings FROM app_settings WHERE id = $1`, [SHARED_DATA_ID])
   ]);
 
@@ -493,307 +542,79 @@ async function loadNormalizedData(executor = db) {
     notifications: notificationsR.rows.map(r => rowJson(r.data_json)),
     deletedRecords: deletedR.rows.map(r => rowJson(r.data_json)),
     expiredCustomers: expiredR.rows.map(r => rowJson(r.data_json)),
-    pendingQueue: schedulesR.rows
-      .filter(r => r.manual_pending === true)
-      .map(r => String(rowJson(r.data_json).id || ''))
-      .filter(Boolean),
+    pendingQueue: schedulesR.rows.filter(r => r.manual_pending === true).map(r => String(rowJson(r.data_json).id || '')).filter(Boolean),
     settings: rowJson(settingsR.rows[0]?.settings)
   });
 }
 
 async function syncNormalizedFull(client, data) {
   const source = normalizeData(data);
-  const j = JSON.stringify;
-
-  // Dependency order matters because normalized tables use foreign keys.
   await client.query('TRUNCATE TABLE payments, schedules, blacklist, notifications, deleted_records, expired_customers, loans, customers CASCADE');
 
-  await client.query(`
-    INSERT INTO customers
-      (id, first_name, middle_name, last_name, name, mobile, alternate_mobile, reference, address, city, district, pincode, status, created_at, updated_at, data_json)
-    SELECT
-      src.raw->>'id',
-      COALESCE(NULLIF(src.raw->>'firstName',''), NULLIF(src.raw->>'first_name','')),
-      COALESCE(NULLIF(src.raw->>'middleName',''), NULLIF(src.raw->>'middle_name','')),
-      COALESCE(NULLIF(src.raw->>'lastName',''), NULLIF(src.raw->>'last_name','')),
-      src.raw->>'name',
-      COALESCE(NULLIF(src.raw->>'mobile',''), NULLIF(src.raw->>'phone','')),
-      COALESCE(NULLIF(src.raw->>'alternateMobile',''), NULLIF(src.raw->>'alternate_mobile','')),
-      COALESCE(NULLIF(src.raw->>'reference',''), NULLIF(src.raw->>'customerReference','')),
-      src.raw->>'address', src.raw->>'city', src.raw->>'district', src.raw->>'pincode', src.raw->>'status',
-      NULLIF(COALESCE(src.raw->>'createdAt', src.raw->>'created_at'),'')::timestamptz,
-      NULLIF(COALESCE(src.raw->>'updatedAt', src.raw->>'updated_at'),'')::timestamptz,
-      src.raw
-    FROM jsonb_array_elements($1::jsonb) AS src(raw)
-    WHERE NULLIF(src.raw->>'id','') IS NOT NULL
-  `, [j(source.customers)]);
-
-  await client.query(`
-    INSERT INTO loans
-      (id, customer_id, khata_no, loan_type, loan_against, amount, rate, emi, emi_option, start_date, status, created_at, updated_at, data_json)
-    SELECT
-      src.raw->>'id',
-      COALESCE(NULLIF(src.raw->>'customerId',''), NULLIF(src.raw->>'customer_id','')),
-      COALESCE(NULLIF(src.raw->>'khataNo',''), NULLIF(src.raw->>'khata_no',''), NULLIF(src.raw->>'legacyKhataNo',''), NULLIF(src.raw->>'legacy_khata_no','')),
-      COALESCE(NULLIF(src.raw->>'loanType',''), NULLIF(src.raw->>'loan_type','')),
-      COALESCE(NULLIF(src.raw->>'loanAgainst',''), NULLIF(src.raw->>'loan_against','')),
-      COALESCE(NULLIF(src.raw->>'amount','')::numeric, 0),
-      COALESCE(NULLIF(src.raw->>'interestRate','')::numeric, NULLIF(src.raw->>'rate','')::numeric, 0),
-      COALESCE(NULLIF(src.raw->>'emi','')::numeric, 0),
-      COALESCE(NULLIF(src.raw->>'emiOption',''), NULLIF(src.raw->>'emi_option','')),
-      NULLIF(COALESCE(src.raw->>'startDate', src.raw->>'start_date'),'')::date,
-      src.raw->>'status',
-      NULLIF(COALESCE(src.raw->>'createdAt', src.raw->>'created_at'),'')::timestamptz,
-      NULLIF(COALESCE(src.raw->>'updatedAt', src.raw->>'updated_at'),'')::timestamptz,
-      src.raw
-    FROM jsonb_array_elements($1::jsonb) AS src(raw)
-    WHERE NULLIF(src.raw->>'id','') IS NOT NULL
-  `, [j(source.loans)]);
-
-  await client.query(`
-    INSERT INTO schedules
-      (id, loan_id, due_date, installment_no, emi, principal, interest, penalty, paid, remaining, status, manual_pending, pending_added_at, pending_added_by, data_json)
-    SELECT
-      src.raw->>'id',
-      COALESCE(NULLIF(src.raw->>'loanId',''), NULLIF(src.raw->>'loan_id','')),
-      NULLIF(COALESCE(src.raw->>'dueDate', src.raw->>'due_date'),'')::date,
-      COALESCE(NULLIF(src.raw->>'installment','')::int, NULLIF(src.raw->>'installmentNo','')::int, NULLIF(src.raw->>'installment_no','')::int),
-      COALESCE(NULLIF(src.raw->>'emi','')::numeric, 0),
-      COALESCE(NULLIF(src.raw->>'principal','')::numeric, 0),
-      COALESCE(NULLIF(src.raw->>'interest','')::numeric, 0),
-      COALESCE(NULLIF(src.raw->>'penalty','')::numeric, 0),
-      COALESCE(NULLIF(src.raw->>'paid','')::numeric, 0),
-      COALESCE(NULLIF(src.raw->>'remaining','')::numeric, 0),
-      src.raw->>'status',
-      COALESCE(NULLIF(src.raw->>'manualPending','')::boolean, NULLIF(src.raw->>'manual_pending','')::boolean, false),
-      NULLIF(COALESCE(src.raw->>'pendingAddedAt', src.raw->>'pending_added_at'),'')::timestamptz,
-      COALESCE(NULLIF(src.raw->>'pendingAddedBy',''), NULLIF(src.raw->>'pending_added_by','')),
-      src.raw
-    FROM jsonb_array_elements($1::jsonb) AS src(raw)
-    WHERE NULLIF(src.raw->>'id','') IS NOT NULL
-  `, [j(source.schedules)]);
-
-  await client.query(`
-    INSERT INTO payments
-      (id, loan_id, schedule_id, payment_date, principal, interest, penalty, total, mode, notes, created_at, activity_created_at, data_json)
-    SELECT
-      src.raw->>'id',
-      COALESCE(NULLIF(src.raw->>'loanId',''), NULLIF(src.raw->>'loan_id','')),
-      NULLIF(COALESCE(src.raw->>'scheduleId', src.raw->>'schedule_id'),'') ,
-      NULLIF(COALESCE(src.raw->>'date', src.raw->>'paymentDate', src.raw->>'payment_date'),'')::date,
-      COALESCE(NULLIF(src.raw->>'principal','')::numeric, 0),
-      COALESCE(NULLIF(src.raw->>'interest','')::numeric, 0),
-      COALESCE(NULLIF(src.raw->>'penalty','')::numeric, 0),
-      COALESCE(NULLIF(src.raw->>'total','')::numeric, 0),
-      src.raw->>'mode', src.raw->>'notes',
-      NULLIF(COALESCE(src.raw->>'createdAt', src.raw->>'created_at'),'')::timestamptz,
-      NULLIF(COALESCE(src.raw->>'activityCreatedAt', src.raw->>'activity_created_at'),'')::timestamptz,
-      src.raw
-    FROM jsonb_array_elements($1::jsonb) AS src(raw)
-    WHERE NULLIF(src.raw->>'id','') IS NOT NULL
-  `, [j(source.payments)]);
-
-  await client.query(`
-    INSERT INTO blacklist (id, customer_id, reason, blacklist_date, notes, outstanding, created_at, data_json)
-    SELECT src.raw->>'id',
-      COALESCE(NULLIF(src.raw->>'customerId',''), NULLIF(src.raw->>'customer_id','')),
-      src.raw->>'reason',
-      NULLIF(COALESCE(src.raw->>'date', src.raw->>'blacklistDate', src.raw->>'blacklist_date'),'')::date,
-      src.raw->>'notes', COALESCE(NULLIF(src.raw->>'outstanding','')::numeric,0),
-      NULLIF(COALESCE(src.raw->>'createdAt', src.raw->>'created_at'),'')::timestamptz, src.raw
-    FROM jsonb_array_elements($1::jsonb) AS src(raw)
-    WHERE NULLIF(src.raw->>'id','') IS NOT NULL
-  `, [j(source.blacklist)]);
-
-  await client.query(`
-    INSERT INTO notifications (id, customer_id, type, title, message, read, created_at, data_json)
-    SELECT src.raw->>'id', NULLIF(COALESCE(src.raw->>'customerId', src.raw->>'customer_id'),'') ,
-      src.raw->>'type', src.raw->>'title', src.raw->>'message',
-      COALESCE(NULLIF(src.raw->>'read','')::boolean, false),
-      NULLIF(COALESCE(src.raw->>'createdAt', src.raw->>'created_at'),'')::timestamptz, src.raw
-    FROM jsonb_array_elements($1::jsonb) AS src(raw)
-    WHERE NULLIF(src.raw->>'id','') IS NOT NULL
-  `, [j(source.notifications)]);
-
-  await client.query(`
-    INSERT INTO deleted_records (id, record_type, record_id, deleted_at, deleted_by, data_json)
-    SELECT src.raw->>'id', COALESCE(NULLIF(src.raw->>'recordType',''), NULLIF(src.raw->>'record_type','')),
-      COALESCE(NULLIF(src.raw->>'recordId',''), NULLIF(src.raw->>'record_id','')),
-      NULLIF(COALESCE(src.raw->>'deletedAt', src.raw->>'deleted_at'),'')::timestamptz,
-      COALESCE(NULLIF(src.raw->>'deletedBy',''), NULLIF(src.raw->>'deleted_by','')), src.raw
-    FROM jsonb_array_elements($1::jsonb) AS src(raw)
-    WHERE NULLIF(src.raw->>'id','') IS NOT NULL
-  `, [j(source.deletedRecords)]);
-
-  await client.query(`
-    INSERT INTO expired_customers (id, customer_id, reason, expired_date, notes, data_json)
-    SELECT src.raw->>'id', COALESCE(NULLIF(src.raw->>'customerId',''), NULLIF(src.raw->>'customer_id','')),
-      COALESCE(NULLIF(src.raw->>'reason',''), NULLIF(src.raw->>'status','')),
-      NULLIF(COALESCE(src.raw->>'date', src.raw->>'expiredDate', src.raw->>'expired_date'),'')::date,
-      src.raw->>'notes', src.raw
-    FROM jsonb_array_elements($1::jsonb) AS src(raw)
-    WHERE NULLIF(src.raw->>'id','') IS NOT NULL
-  `, [j(source.expiredCustomers)]);
+  for (const c of source.customers) {
+    await client.query(`INSERT INTO customers
+      (id, first_name, middle_name, last_name, name, mobile, alternate_mobile, reference, address, city, district, pincode, status, created_at, updated_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+      ON CONFLICT (id) DO UPDATE SET first_name=EXCLUDED.first_name,middle_name=EXCLUDED.middle_name,last_name=EXCLUDED.last_name,name=EXCLUDED.name,mobile=EXCLUDED.mobile,alternate_mobile=EXCLUDED.alternate_mobile,reference=EXCLUDED.reference,address=EXCLUDED.address,city=EXCLUDED.city,district=EXCLUDED.district,pincode=EXCLUDED.pincode,status=EXCLUDED.status,created_at=EXCLUDED.created_at,updated_at=EXCLUDED.updated_at`,
+      [c.id,c.firstName||null,c.middleName||null,c.lastName||null,c.name||null,c.mobile||c.phone||null,c.alternateMobile||null,c.reference||c.customerReference||null,c.address||null,c.city||null,c.district||null,c.pincode||null,c.status||null,c.createdAt||null,c.updatedAt||null]);
+    await client.query('DELETE FROM customer_guarantors WHERE customer_id=$1',[c.id]);
+    if (String(c.guarantorName||'').trim()) await client.query('INSERT INTO customer_guarantors(id,customer_id,name,mobile,address) VALUES ($1,$2,$3,$4,$5) ON CONFLICT(id) DO UPDATE SET name=EXCLUDED.name,mobile=EXCLUDED.mobile,address=EXCLUDED.address',['G-'+c.id,c.id,String(c.guarantorName).trim(),c.guarantorMobile||null,c.guarantorAddress||null]);
+  }
+  for (const l of source.loans) {
+    await client.query(`INSERT INTO loans
+      (id, customer_id, khata_no, legacy_khata_no, loan_type, loan_against, amount, rate, emi, emi_option, start_date, duration_months, due_day, interest_method, penalty_per_installment, notes, status, created_at, updated_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+      ON CONFLICT (id) DO UPDATE SET customer_id=EXCLUDED.customer_id,khata_no=EXCLUDED.khata_no,legacy_khata_no=EXCLUDED.legacy_khata_no,loan_type=EXCLUDED.loan_type,loan_against=EXCLUDED.loan_against,amount=EXCLUDED.amount,rate=EXCLUDED.rate,emi=EXCLUDED.emi,emi_option=EXCLUDED.emi_option,start_date=EXCLUDED.start_date,duration_months=EXCLUDED.duration_months,due_day=EXCLUDED.due_day,interest_method=EXCLUDED.interest_method,penalty_per_installment=EXCLUDED.penalty_per_installment,notes=EXCLUDED.notes,status=EXCLUDED.status,created_at=EXCLUDED.created_at,updated_at=EXCLUDED.updated_at`,
+      [l.id,l.customerId,l.khataNo||null,l.legacyKhataNo||null,l.loanType||null,l.loanAgainst||null,Number(l.amount||0),Number(l.interestRate??l.rate??0),Number(l.emi||0),l.emiOption||null,l.startDate||null,Number(l.duration||l.durationMonths||0)||null,Number(l.dueDay||0)||null,l.method||l.interestMethod||null,Number(l.penalty||l.penaltyPerInstallment||0),l.notes||null,l.status||null,l.createdAt||null,l.updatedAt||null]);
+  }
+  for (const sc of source.schedules) {
+    await client.query(`INSERT INTO schedules
+      (id, loan_id, due_date, installment_no, emi, principal, interest, penalty, paid, remaining, status, manual_pending, pending_added_at, pending_added_by)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+      ON CONFLICT (id) DO UPDATE SET loan_id=EXCLUDED.loan_id,due_date=EXCLUDED.due_date,installment_no=EXCLUDED.installment_no,emi=EXCLUDED.emi,principal=EXCLUDED.principal,interest=EXCLUDED.interest,penalty=EXCLUDED.penalty,paid=EXCLUDED.paid,remaining=EXCLUDED.remaining,status=EXCLUDED.status,manual_pending=EXCLUDED.manual_pending,pending_added_at=EXCLUDED.pending_added_at,pending_added_by=EXCLUDED.pending_added_by`,
+      [sc.id,sc.loanId,sc.dueDate||null,sc.installment??sc.installmentNo??null,Number(sc.emi||0),Number(sc.principal||0),Number(sc.interest||0),Number(sc.penalty||0),Number(sc.paid||0),Number(sc.remaining||0),sc.status||null,Boolean(sc.manualPending),sc.pendingAddedAt||null,sc.pendingAddedBy||null]);
+  }
+  for (const pay of source.payments) {
+    await client.query(`INSERT INTO payments
+      (id, loan_id, schedule_id, payment_date, principal, interest, penalty, total, mode, notes, created_at, activity_created_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+      ON CONFLICT (id) DO UPDATE SET loan_id=EXCLUDED.loan_id,schedule_id=EXCLUDED.schedule_id,payment_date=EXCLUDED.payment_date,principal=EXCLUDED.principal,interest=EXCLUDED.interest,penalty=EXCLUDED.penalty,total=EXCLUDED.total,mode=EXCLUDED.mode,notes=EXCLUDED.notes,created_at=EXCLUDED.created_at,activity_created_at=EXCLUDED.activity_created_at`,
+      [pay.id,pay.loanId,pay.scheduleId||null,pay.date||pay.paymentDate||null,Number(pay.principal||0),Number(pay.interest||0),Number(pay.penalty||0),Number(pay.total||0),pay.mode||null,pay.notes||null,pay.createdAt||null,pay.activityCreatedAt||null]);
+  }
+  for (const b of source.blacklist) await client.query(`INSERT INTO blacklist (id,customer_id,reason,blacklist_date,notes,outstanding,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(id) DO UPDATE SET customer_id=EXCLUDED.customer_id,reason=EXCLUDED.reason,blacklist_date=EXCLUDED.blacklist_date,notes=EXCLUDED.notes,outstanding=EXCLUDED.outstanding,created_at=EXCLUDED.created_at`, [b.id,b.customerId,b.reason||null,b.date||b.blacklistDate||null,b.notes||null,Number(b.outstanding||0),b.createdAt||null]);
+  for (const n of source.notifications) await client.query(`INSERT INTO notifications (id,customer_id,type,title,message,read,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(id) DO UPDATE SET customer_id=EXCLUDED.customer_id,type=EXCLUDED.type,title=EXCLUDED.title,message=EXCLUDED.message,read=EXCLUDED.read,created_at=EXCLUDED.created_at`, [n.id,n.customerId||null,n.type||null,n.title||null,n.message||null,Boolean(n.read),n.createdAt||null]);
+  for (const d of source.deletedRecords) await client.query(`INSERT INTO deleted_records (id,record_type,record_id,deleted_at,deleted_by,snapshot_json) VALUES ($1,$2,$3,$4,$5,$6::jsonb) ON CONFLICT(id) DO UPDATE SET record_type=EXCLUDED.record_type,record_id=EXCLUDED.record_id,deleted_at=EXCLUDED.deleted_at,deleted_by=EXCLUDED.deleted_by,snapshot_json=EXCLUDED.snapshot_json`, [d.id,d.recordType||null,d.recordId||null,d.deletedAt||null,d.deletedBy||null,JSON.stringify(d)]);
+  for (const ex of source.expiredCustomers) await client.query(`INSERT INTO expired_customers (id,customer_id,reason,expired_date,notes) VALUES ($1,$2,$3,$4,$5) ON CONFLICT(id) DO UPDATE SET customer_id=EXCLUDED.customer_id,reason=EXCLUDED.reason,expired_date=EXCLUDED.expired_date,notes=EXCLUDED.notes`, [ex.id,ex.customerId,ex.reason||ex.status||null,ex.date||ex.expiredDate||null,ex.notes||null]);
 }
 
 async function syncNormalizedOperations(client, data, operations) {
-  const groups = {
-    customers: [], loans: [], schedules: [], payments: [], blacklist: [],
-    notifications: [], deletedRecords: [], expiredCustomers: []
-  };
-  const deletes = {
-    customers: [], loans: [], schedules: [], payments: [], blacklist: [],
-    notifications: [], deletedRecords: [], expiredCustomers: []
-  };
+  const groups = { customers: [], loans: [], schedules: [], payments: [], blacklist: [], notifications: [], deletedRecords: [], expiredCustomers: [] };
+  const deletes = { customers: [], loans: [], schedules: [], payments: [], blacklist: [], notifications: [], deletedRecords: [], expiredCustomers: [] };
   let replacePendingQueue = false;
-
   for (const op of operations) {
-    const type = String(op.type || '');
-    const action = String(op.action || '');
-    if (type === 'pendingQueue' && action === 'replace') {
-      replacePendingQueue = true;
-      continue;
-    }
+    const type=String(op.type||''), action=String(op.action||'');
+    if (type==='pendingQueue' && action==='replace') { replacePendingQueue=true; continue; }
     if (!groups[type]) continue;
-    const id = String(op.id ?? op.record?.id ?? '');
-    if (!id) continue;
-    if (action === 'create' || action === 'update') groups[type].push(op.record);
-    else if (action === 'delete') deletes[type].push(id);
+    const id=String(op.id ?? op.record?.id ?? ''); if(!id) continue;
+    if(action==='create'||action==='update') groups[type].push(op.record); else if(action==='delete') deletes[type].push(id);
   }
-
-  // Deletes first for independent child records; customer/loan deletes use FK
-  // cascades and therefore happen after explicit child deletions.
-  for (const type of ['payments', 'schedules', 'blacklist', 'notifications', 'expiredCustomers', 'loans', 'customers', 'deletedRecords']) {
-    for (const id of deletes[type]) {
-      const table = type === 'expiredCustomers' ? 'expired_customers' :
-        type === 'deletedRecords' ? 'deleted_records' : type;
-      await client.query(`DELETE FROM ${table} WHERE id = $1`, [id]);
-    }
+  for (const type of ['payments','schedules','blacklist','notifications','expiredCustomers','loans','customers','deletedRecords']) {
+    for (const id of deletes[type]) await client.query(`DELETE FROM ${type==='expiredCustomers'?'expired_customers':type==='deletedRecords'?'deleted_records':type} WHERE id=$1`,[id]);
   }
-
-  for (const c of groups.customers) {
-    await client.query(`
-      INSERT INTO customers
-        (id, first_name, middle_name, last_name, name, mobile, alternate_mobile, reference, address, city, district, pincode, status, created_at, updated_at, data_json)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16::jsonb)
-      ON CONFLICT (id) DO UPDATE SET
-        first_name=EXCLUDED.first_name, middle_name=EXCLUDED.middle_name, last_name=EXCLUDED.last_name,
-        name=EXCLUDED.name, mobile=EXCLUDED.mobile, alternate_mobile=EXCLUDED.alternate_mobile,
-        reference=EXCLUDED.reference, address=EXCLUDED.address, city=EXCLUDED.city, district=EXCLUDED.district,
-        pincode=EXCLUDED.pincode, status=EXCLUDED.status, created_at=EXCLUDED.created_at,
-        updated_at=EXCLUDED.updated_at, data_json=EXCLUDED.data_json
-    `, [
-      c.id, c.firstName || null, c.middleName || null, c.lastName || null, c.name || null,
-      c.mobile || c.phone || null, c.alternateMobile || null, c.reference || c.customerReference || null,
-      c.address || null, c.city || null, c.district || null, c.pincode || null, c.status || null,
-      c.createdAt || null, c.updatedAt || null, JSON.stringify(c)
-    ]);
-  }
-
-  for (const l of groups.loans) {
-    await client.query(`
-      INSERT INTO loans
-        (id, customer_id, khata_no, loan_type, loan_against, amount, rate, emi, emi_option, start_date, status, created_at, updated_at, data_json)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::jsonb)
-      ON CONFLICT (id) DO UPDATE SET
-        customer_id=EXCLUDED.customer_id, khata_no=EXCLUDED.khata_no, loan_type=EXCLUDED.loan_type,
-        loan_against=EXCLUDED.loan_against, amount=EXCLUDED.amount, rate=EXCLUDED.rate, emi=EXCLUDED.emi,
-        emi_option=EXCLUDED.emi_option, start_date=EXCLUDED.start_date, status=EXCLUDED.status,
-        created_at=EXCLUDED.created_at, updated_at=EXCLUDED.updated_at, data_json=EXCLUDED.data_json
-    `, [
-      l.id, l.customerId, l.khataNo || l.legacyKhataNo || null, l.loanType || null, l.loanAgainst || null,
-      Number(l.amount || 0), Number(l.interestRate ?? l.rate ?? 0), Number(l.emi || 0), l.emiOption || null,
-      l.startDate || null, l.status || null, l.createdAt || null, l.updatedAt || null, JSON.stringify(l)
-    ]);
-  }
-
-  for (const sc of groups.schedules) {
-    await client.query(`
-      INSERT INTO schedules
-        (id, loan_id, due_date, installment_no, emi, principal, interest, penalty, paid, remaining, status, manual_pending, pending_added_at, pending_added_by, data_json)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15::jsonb)
-      ON CONFLICT (id) DO UPDATE SET
-        loan_id=EXCLUDED.loan_id, due_date=EXCLUDED.due_date, installment_no=EXCLUDED.installment_no,
-        emi=EXCLUDED.emi, principal=EXCLUDED.principal, interest=EXCLUDED.interest, penalty=EXCLUDED.penalty,
-        paid=EXCLUDED.paid, remaining=EXCLUDED.remaining, status=EXCLUDED.status, manual_pending=EXCLUDED.manual_pending,
-        pending_added_at=EXCLUDED.pending_added_at, pending_added_by=EXCLUDED.pending_added_by, data_json=EXCLUDED.data_json
-    `, [
-      sc.id, sc.loanId, sc.dueDate || null, sc.installment ?? sc.installmentNo ?? null, Number(sc.emi || 0),
-      Number(sc.principal || 0), Number(sc.interest || 0), Number(sc.penalty || 0), Number(sc.paid || 0),
-      Number(sc.remaining || 0), sc.status || null, Boolean(sc.manualPending), sc.pendingAddedAt || null,
-      sc.pendingAddedBy || null, JSON.stringify(sc)
-    ]);
-  }
-
-  for (const pay of groups.payments) {
-    await client.query(`
-      INSERT INTO payments
-        (id, loan_id, schedule_id, payment_date, principal, interest, penalty, total, mode, notes, created_at, activity_created_at, data_json)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb)
-      ON CONFLICT (id) DO UPDATE SET
-        loan_id=EXCLUDED.loan_id, schedule_id=EXCLUDED.schedule_id, payment_date=EXCLUDED.payment_date,
-        principal=EXCLUDED.principal, interest=EXCLUDED.interest, penalty=EXCLUDED.penalty, total=EXCLUDED.total,
-        mode=EXCLUDED.mode, notes=EXCLUDED.notes, created_at=EXCLUDED.created_at,
-        activity_created_at=EXCLUDED.activity_created_at, data_json=EXCLUDED.data_json
-    `, [
-      pay.id, pay.loanId, pay.scheduleId || null, pay.date || pay.paymentDate || null,
-      Number(pay.principal || 0), Number(pay.interest || 0), Number(pay.penalty || 0), Number(pay.total || 0),
-      pay.mode || null, pay.notes || null, pay.createdAt || null, pay.activityCreatedAt || null, JSON.stringify(pay)
-    ]);
-  }
-
-  for (const b of groups.blacklist) {
-    await client.query(`
-      INSERT INTO blacklist (id, customer_id, reason, blacklist_date, notes, outstanding, created_at, data_json)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb)
-      ON CONFLICT (id) DO UPDATE SET customer_id=EXCLUDED.customer_id, reason=EXCLUDED.reason,
-        blacklist_date=EXCLUDED.blacklist_date, notes=EXCLUDED.notes, outstanding=EXCLUDED.outstanding,
-        created_at=EXCLUDED.created_at, data_json=EXCLUDED.data_json
-    `, [b.id, b.customerId, b.reason || null, b.date || b.blacklistDate || null, b.notes || null,
-    Number(b.outstanding || 0), b.createdAt || null, JSON.stringify(b)]);
-  }
-
-  for (const n of groups.notifications) {
-    await client.query(`
-      INSERT INTO notifications (id, customer_id, type, title, message, read, created_at, data_json)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb)
-      ON CONFLICT (id) DO UPDATE SET customer_id=EXCLUDED.customer_id, type=EXCLUDED.type,
-        title=EXCLUDED.title, message=EXCLUDED.message, read=EXCLUDED.read, created_at=EXCLUDED.created_at,
-        data_json=EXCLUDED.data_json
-    `, [n.id, n.customerId || null, n.type || null, n.title || null, n.message || null,
-    Boolean(n.read), n.createdAt || null, JSON.stringify(n)]);
-  }
-
-  for (const d of groups.deletedRecords) {
-    await client.query(`
-      INSERT INTO deleted_records (id, record_type, record_id, deleted_at, deleted_by, data_json)
-      VALUES ($1,$2,$3,$4,$5,$6::jsonb)
-      ON CONFLICT (id) DO UPDATE SET record_type=EXCLUDED.record_type, record_id=EXCLUDED.record_id,
-        deleted_at=EXCLUDED.deleted_at, deleted_by=EXCLUDED.deleted_by, data_json=EXCLUDED.data_json
-    `, [d.id, d.recordType || null, d.recordId || null, d.deletedAt || null, d.deletedBy || null, JSON.stringify(d)]);
-  }
-
-  for (const ex of groups.expiredCustomers) {
-    await client.query(`
-      INSERT INTO expired_customers (id, customer_id, reason, expired_date, notes, data_json)
-      VALUES ($1,$2,$3,$4,$5,$6::jsonb)
-      ON CONFLICT (id) DO UPDATE SET customer_id=EXCLUDED.customer_id, reason=EXCLUDED.reason,
-        expired_date=EXCLUDED.expired_date, notes=EXCLUDED.notes, data_json=EXCLUDED.data_json
-    `, [ex.id, ex.customerId, ex.reason || ex.status || null, ex.date || ex.expiredDate || null,
-    ex.notes || null, JSON.stringify(ex)]);
-  }
-
+  // Reuse the same normalized write path for the records that changed. No JSON mirror is written.
+  for (const c of groups.customers) await client.query(`INSERT INTO customers (id,first_name,middle_name,last_name,name,mobile,alternate_mobile,reference,address,city,district,pincode,status,created_at,updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) ON CONFLICT(id) DO UPDATE SET first_name=EXCLUDED.first_name,middle_name=EXCLUDED.middle_name,last_name=EXCLUDED.last_name,name=EXCLUDED.name,mobile=EXCLUDED.mobile,alternate_mobile=EXCLUDED.alternate_mobile,reference=EXCLUDED.reference,address=EXCLUDED.address,city=EXCLUDED.city,district=EXCLUDED.district,pincode=EXCLUDED.pincode,status=EXCLUDED.status,created_at=EXCLUDED.created_at,updated_at=EXCLUDED.updated_at`,[c.id,c.firstName||null,c.middleName||null,c.lastName||null,c.name||null,c.mobile||c.phone||null,c.alternateMobile||null,c.reference||c.customerReference||null,c.address||null,c.city||null,c.district||null,c.pincode||null,c.status||null,c.createdAt||null,c.updatedAt||null]);
+    await client.query('DELETE FROM customer_guarantors WHERE customer_id=$1',[c.id]);
+    if (String(c.guarantorName||'').trim()) await client.query('INSERT INTO customer_guarantors(id,customer_id,name,mobile,address) VALUES ($1,$2,$3,$4,$5) ON CONFLICT(id) DO UPDATE SET name=EXCLUDED.name,mobile=EXCLUDED.mobile,address=EXCLUDED.address',['G-'+c.id,c.id,String(c.guarantorName).trim(),c.guarantorMobile||null,c.guarantorAddress||null]);
+  for (const l of groups.loans) await client.query(`INSERT INTO loans (id,customer_id,khata_no,legacy_khata_no,loan_type,loan_against,amount,rate,emi,emi_option,start_date,duration_months,due_day,interest_method,penalty_per_installment,notes,status,created_at,updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19) ON CONFLICT(id) DO UPDATE SET customer_id=EXCLUDED.customer_id,khata_no=EXCLUDED.khata_no,legacy_khata_no=EXCLUDED.legacy_khata_no,loan_type=EXCLUDED.loan_type,loan_against=EXCLUDED.loan_against,amount=EXCLUDED.amount,rate=EXCLUDED.rate,emi=EXCLUDED.emi,emi_option=EXCLUDED.emi_option,start_date=EXCLUDED.start_date,duration_months=EXCLUDED.duration_months,due_day=EXCLUDED.due_day,interest_method=EXCLUDED.interest_method,penalty_per_installment=EXCLUDED.penalty_per_installment,notes=EXCLUDED.notes,status=EXCLUDED.status,created_at=EXCLUDED.created_at,updated_at=EXCLUDED.updated_at`,[l.id,l.customerId,l.khataNo||null,l.legacyKhataNo||null,l.loanType||null,l.loanAgainst||null,Number(l.amount||0),Number(l.interestRate??l.rate??0),Number(l.emi||0),l.emiOption||null,l.startDate||null,Number(l.duration||l.durationMonths||0)||null,Number(l.dueDay||0)||null,l.method||l.interestMethod||null,Number(l.penalty||l.penaltyPerInstallment||0),l.notes||null,l.status||null,l.createdAt||null,l.updatedAt||null]);
+  for (const sc of groups.schedules) await client.query(`INSERT INTO schedules (id,loan_id,due_date,installment_no,emi,principal,interest,penalty,paid,remaining,status,manual_pending,pending_added_at,pending_added_by) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) ON CONFLICT(id) DO UPDATE SET loan_id=EXCLUDED.loan_id,due_date=EXCLUDED.due_date,installment_no=EXCLUDED.installment_no,emi=EXCLUDED.emi,principal=EXCLUDED.principal,interest=EXCLUDED.interest,penalty=EXCLUDED.penalty,paid=EXCLUDED.paid,remaining=EXCLUDED.remaining,status=EXCLUDED.status,manual_pending=EXCLUDED.manual_pending,pending_added_at=EXCLUDED.pending_added_at,pending_added_by=EXCLUDED.pending_added_by`,[sc.id,sc.loanId,sc.dueDate||null,sc.installment??sc.installmentNo??null,Number(sc.emi||0),Number(sc.principal||0),Number(sc.interest||0),Number(sc.penalty||0),Number(sc.paid||0),Number(sc.remaining||0),sc.status||null,Boolean(sc.manualPending),sc.pendingAddedAt||null,sc.pendingAddedBy||null]);
+  for (const pay of groups.payments) await client.query(`INSERT INTO payments (id,loan_id,schedule_id,payment_date,principal,interest,penalty,total,mode,notes,created_at,activity_created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT(id) DO UPDATE SET loan_id=EXCLUDED.loan_id,schedule_id=EXCLUDED.schedule_id,payment_date=EXCLUDED.payment_date,principal=EXCLUDED.principal,interest=EXCLUDED.interest,penalty=EXCLUDED.penalty,total=EXCLUDED.total,mode=EXCLUDED.mode,notes=EXCLUDED.notes,created_at=EXCLUDED.created_at,activity_created_at=EXCLUDED.activity_created_at`,[pay.id,pay.loanId,pay.scheduleId||null,pay.date||pay.paymentDate||null,Number(pay.principal||0),Number(pay.interest||0),Number(pay.penalty||0),Number(pay.total||0),pay.mode||null,pay.notes||null,pay.createdAt||null,pay.activityCreatedAt||null]);
+  for (const b of groups.blacklist) await client.query(`INSERT INTO blacklist (id,customer_id,reason,blacklist_date,notes,outstanding,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(id) DO UPDATE SET customer_id=EXCLUDED.customer_id,reason=EXCLUDED.reason,blacklist_date=EXCLUDED.blacklist_date,notes=EXCLUDED.notes,outstanding=EXCLUDED.outstanding,created_at=EXCLUDED.created_at`,[b.id,b.customerId,b.reason||null,b.date||b.blacklistDate||null,b.notes||null,Number(b.outstanding||0),b.createdAt||null]);
+  for (const n of groups.notifications) await client.query(`INSERT INTO notifications (id,customer_id,type,title,message,read,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(id) DO UPDATE SET customer_id=EXCLUDED.customer_id,type=EXCLUDED.type,title=EXCLUDED.title,message=EXCLUDED.message,read=EXCLUDED.read,created_at=EXCLUDED.created_at`,[n.id,n.customerId||null,n.type||null,n.title||null,n.message||null,Boolean(n.read),n.createdAt||null]);
+  for (const d of groups.deletedRecords) await client.query(`INSERT INTO deleted_records (id,record_type,record_id,deleted_at,deleted_by,snapshot_json) VALUES ($1,$2,$3,$4,$5,$6::jsonb) ON CONFLICT(id) DO UPDATE SET record_type=EXCLUDED.record_type,record_id=EXCLUDED.record_id,deleted_at=EXCLUDED.deleted_at,deleted_by=EXCLUDED.deleted_by,snapshot_json=EXCLUDED.snapshot_json`,[d.id,d.recordType||null,d.recordId||null,d.deletedAt||null,d.deletedBy||null,JSON.stringify(d)]);
+  for (const ex of groups.expiredCustomers) await client.query(`INSERT INTO expired_customers (id,customer_id,reason,expired_date,notes) VALUES ($1,$2,$3,$4,$5) ON CONFLICT(id) DO UPDATE SET customer_id=EXCLUDED.customer_id,reason=EXCLUDED.reason,expired_date=EXCLUDED.expired_date,notes=EXCLUDED.notes`,[ex.id,ex.customerId,ex.reason||ex.status||null,ex.date||ex.expiredDate||null,ex.notes||null]);
   if (replacePendingQueue) {
-    const pending = new Set((data.pendingQueue || []).map(String));
-    await client.query(`UPDATE schedules SET manual_pending = (id = ANY($1::text[]))`, [[...pending]]);
-    // Keep the JSON representation compatible with the existing frontend contract.
-    await client.query(`
-      UPDATE schedules
-      SET data_json = CASE
-        WHEN manual_pending THEN jsonb_set(COALESCE(data_json,'{}'::jsonb), '{manualPending}', 'true'::jsonb, true)
-        ELSE jsonb_set(COALESCE(data_json,'{}'::jsonb), '{manualPending}', 'false'::jsonb, true)
-      END
-    `);
+    const pending=[...(new Set((data.pendingQueue||[]).map(String)))];
+    await client.query(`UPDATE schedules SET manual_pending = id = ANY($1::text[]), pending_added_at = CASE WHEN id=ANY($1::text[]) THEN COALESCE(pending_added_at,NOW()) ELSE NULL END WHERE manual_pending <> (id = ANY($1::text[])) OR (manual_pending AND pending_added_at IS NULL)`,[pending]);
   }
 }
 
@@ -1648,8 +1469,8 @@ async function buildDashboardDataFast(asOf, range = '6m') {
       WHERE p.payment_date=$1
     `, [today]),
     db.query(`
-      SELECT s.data_json AS schedule_json, s.id, s.loan_id, s.emi, s.paid, s.penalty,
-             c.data_json AS customer_json, l.data_json AS loan_json,
+      SELECT schedule_to_json(s) AS schedule_json, s.id, s.loan_id, s.emi, s.paid, s.penalty,
+             customer_to_json(c) AS customer_json, loan_to_json(l) AS loan_json,
              COALESCE(sp.pi_paid,0)::numeric AS payment_pi,
              COALESCE(sp.penalty_paid,0)::numeric AS penalty_paid,
              COALESCE(sp.total_paid,0)::numeric AS total_paid
@@ -1722,14 +1543,14 @@ async function buildDashboardDataFast(asOf, range = '6m') {
           AND GREATEST(0, s.emi - GREATEST(s.paid,COALESCE(p.pi_paid,0))) + GREATEST(0,s.penalty-COALESCE(p.penalty_paid,0)) > 0.005
           AND UPPER(COALESCE(l.status,'ACTIVE')) <> 'CLOSED'
       )
-      SELECT c.data_json AS customer_json,
+      SELECT customer_to_json(c) AS customer_json,
              COALESCE(SUM(d.remaining),0)::numeric AS amount,
              COUNT(*)::int AS count,
              MAX(($1::date-d.due_date))::int AS days
       FROM due d
       JOIN loans l ON l.id=d.loan_id
       JOIN customers c ON c.id=l.customer_id
-      GROUP BY c.id, c.data_json
+      GROUP BY c.id, customer_to_json(c)
       ORDER BY amount DESC
       LIMIT 5
     `, [today]),
@@ -1773,7 +1594,7 @@ async function buildDashboardDataFast(asOf, range = '6m') {
         (SELECT COALESCE(SUM(due),0)::numeric FROM deceased_overdue) AS overdue
     `, [today]),
     db.query(`
-      SELECT p.id AS payment_id, p.total, p.payment_date, p.created_at, l.data_json AS loan_json, c.data_json AS customer_json
+      SELECT p.id AS payment_id, p.total, p.payment_date, p.created_at, loan_to_json(l) AS loan_json, customer_to_json(c) AS customer_json
       FROM payments p
       JOIN loans l ON l.id=p.loan_id
       JOIN customers c ON c.id=l.customer_id
@@ -1978,10 +1799,10 @@ async function api(req, res) {
     const paymentId = decodeURIComponent(parts[2]);
     const result = await db.query(`
       SELECT
-        p.data_json AS payment_json,
-        l.data_json AS loan_json,
-        c.data_json AS customer_json,
-        s.data_json AS schedule_json
+        payment_to_json(p) AS payment_json,
+        loan_to_json(l) AS loan_json,
+        customer_to_json(c) AS customer_json,
+        schedule_to_json(s) AS schedule_json
       FROM payments p
       JOIN loans l ON l.id = p.loan_id
       JOIN customers c ON c.id = l.customer_id
@@ -2034,7 +1855,7 @@ async function api(req, res) {
 
     const [paymentResult, countResult] = await Promise.all([
       db.query(`
-        SELECT p.data_json AS payment_json, l.data_json AS loan_json, c.data_json AS customer_json
+        SELECT payment_to_json(p) AS payment_json, loan_to_json(l) AS loan_json, customer_to_json(c) AS customer_json
         ${filterSql}
         ORDER BY p.payment_date DESC NULLS LAST, p.id DESC
         LIMIT $7::int OFFSET $8::int
@@ -2266,13 +2087,13 @@ async function api(req, res) {
     // is no longer loaded for this request.
     const customerResult = await db.query(`
       SELECT
-        c.data_json AS customer_json,
+        customer_to_json(c) AS customer_json,
         COALESCE(ls.loan_count, 0)::int AS loan_count,
         COALESCE(ls.total_loan, 0)::numeric AS total_loan,
         COALESCE(ps.payment_count, 0)::int AS payment_count,
         COALESCE(ss.schedule_count, 0)::int AS schedule_count,
-        b.data_json AS blacklist_json,
-        e.data_json AS expired_json
+        blacklist_to_json(b) AS blacklist_json,
+        expired_customer_to_json(e) AS expired_json
       FROM customers c
       LEFT JOIN (
         SELECT customer_id, COUNT(*)::int AS loan_count, COALESCE(SUM(amount),0)::numeric AS total_loan
@@ -2291,10 +2112,10 @@ async function api(req, res) {
         GROUP BY l.customer_id
       ) ss ON ss.customer_id = c.id
       LEFT JOIN LATERAL (
-        SELECT data_json FROM blacklist WHERE customer_id = c.id ORDER BY created_at DESC NULLS LAST LIMIT 1
+        SELECT blacklist_to_json(b) AS data_json FROM blacklist b WHERE b.customer_id = c.id ORDER BY created_at DESC NULLS LAST LIMIT 1
       ) b ON TRUE
       LEFT JOIN LATERAL (
-        SELECT data_json FROM expired_customers WHERE customer_id = c.id ORDER BY expired_date DESC NULLS LAST LIMIT 1
+        SELECT expired_customer_to_json(e) AS data_json FROM expired_customers e WHERE e.customer_id = c.id ORDER BY expired_date DESC NULLS LAST LIMIT 1
       ) e ON TRUE
       WHERE c.id = $1
       LIMIT 1
@@ -2305,7 +2126,7 @@ async function api(req, res) {
     const customer = typeof row.customer_json === 'string' ? JSON.parse(row.customer_json) : (row.customer_json || {});
 
     const loansResult = await db.query(`
-      SELECT data_json
+      SELECT loan_to_json(loans) AS data_json
       FROM loans
       WHERE customer_id = $1
       ORDER BY start_date DESC NULLS LAST, id DESC
@@ -2316,8 +2137,8 @@ async function api(req, res) {
     let payments = [], schedules = [];
     if (loanIds.length) {
       const [paymentResult, scheduleResult] = await Promise.all([
-        db.query(`SELECT data_json FROM payments WHERE loan_id = ANY($1::text[]) ORDER BY payment_date DESC NULLS LAST, id DESC`, [loanIds]),
-        db.query(`SELECT data_json FROM schedules WHERE loan_id = ANY($1::text[]) ORDER BY due_date DESC NULLS LAST, id DESC`, [loanIds])
+        db.query(`SELECT payment_to_json(payments) AS data_json FROM payments WHERE loan_id = ANY($1::text[]) ORDER BY payment_date DESC NULLS LAST, id DESC`, [loanIds]),
+        db.query(`SELECT schedule_to_json(schedules) AS data_json FROM schedules WHERE loan_id = ANY($1::text[]) ORDER BY due_date DESC NULLS LAST, id DESC`, [loanIds])
       ]);
       payments = paymentResult.rows.map(r => typeof r.data_json === 'string' ? JSON.parse(r.data_json) : r.data_json);
       schedules = scheduleResult.rows.map(r => typeof r.data_json === 'string' ? JSON.parse(r.data_json) : r.data_json);
@@ -2640,7 +2461,7 @@ async function api(req, res) {
         GROUP BY l.customer_id
       ), rows AS (
         SELECT
-          c.data_json AS customer_json,
+          customer_to_json(c) AS customer_json,
           c.id, c.first_name, c.middle_name, c.last_name, c.name,
           c.mobile, c.alternate_mobile, c.reference, c.address, c.city, c.district, c.pincode,
           c.created_at,
@@ -2696,7 +2517,7 @@ async function api(req, res) {
           LEFT JOIN (SELECT loan_id, COALESCE(SUM(principal),0)::numeric AS paid_principal FROM payments GROUP BY loan_id) p ON p.loan_id=l.id
           GROUP BY l.customer_id
         ), rows AS (
-          SELECT c.data_json AS customer_json, c.id, c.first_name, c.middle_name, c.last_name, c.name, c.mobile, c.alternate_mobile,
+          SELECT customer_to_json(c) AS customer_json, c.id, c.first_name, c.middle_name, c.last_name, c.name, c.mobile, c.alternate_mobile,
                  c.reference, c.address, c.city, c.district, c.pincode, c.created_at,
                  COALESCE(lt.loan_count,0)::int AS loan_count, COALESCE(lt.total_loan,0)::numeric AS total_loan, COALESCE(lt.remaining,0)::numeric AS remaining,
                  CASE WHEN EXISTS(SELECT 1 FROM blacklist b WHERE b.customer_id=c.id) THEN 'BLACKLISTED'

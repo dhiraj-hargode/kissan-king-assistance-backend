@@ -251,6 +251,34 @@ async function initDb() {
     )
   `);
 
+  // Existing Render databases may have an older app_settings schema that
+  // stores the JSON document in data_json instead of settings. CREATE TABLE
+  // IF NOT EXISTS does not alter an existing table, so upgrade it in place.
+  // This keeps existing settings intact and avoids a deployment-time failure.
+  await db.query(`
+    ALTER TABLE app_settings
+      ADD COLUMN IF NOT EXISTS settings JSONB NOT NULL DEFAULT '{}'::jsonb
+  `);
+  await db.query(`
+    DO $$
+    BEGIN
+      IF EXISTS (
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'app_settings'
+          AND column_name = 'data_json'
+      ) THEN
+        EXECUTE $sql$
+          UPDATE app_settings
+          SET settings = COALESCE(data_json, '{}'::jsonb)
+          WHERE (settings IS NULL OR settings = '{}'::jsonb)
+            AND data_json IS NOT NULL
+        $sql$;
+      END IF;
+    END $$
+  `);
+
   await db.query(`
     CREATE TABLE IF NOT EXISTS app_backups (
       id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -1610,65 +1638,6 @@ async function api(req, res) {
 
   if (parts[0] !== 'api') return false;
 
-  // Registration is intentionally handled before every protected API route.
-  // This allows the very first Administrator account to be created without an
-  // existing session. Once an account exists, only an Administrator may create
-  // additional accounts. Keeping this route here prevents the global auth guard
-  // below from turning first-account registration into a 401 response.
-  if (method === 'POST' && parts[1] === 'auth' && parts[2] === 'register') {
-    const existing = await countUsers();
-    let requester = null;
-
-    if (existing > 0) {
-      requester = await sessionUser(req);
-      if (!requester || requester.role !== 'Administrator') {
-        return send(res, 403, { error: 'Only the first account can self-register. An Administrator must create additional users.' });
-      }
-    }
-
-    let b;
-    try {
-      b = await readBody(req);
-    } catch (e) {
-      return send(res, 400, { error: e.message || 'Invalid registration request' });
-    }
-
-    const name = String(b.name || '').trim().slice(0, 100);
-    const username = String(b.username || '').trim().toLowerCase();
-    const mobile = String(b.mobile || '').trim();
-    const role = String(b.role || '').trim();
-    const password = String(b.password || '');
-
-    if (existing === 0 && role !== 'Administrator') {
-      return send(res, 400, { error: 'The first account must be Administrator' });
-    }
-
-    if (!name || !/^[a-z0-9._-]{3,30}$/.test(username) || (mobile && !mobileOk(mobile)) ||
-        !ROLES.includes(role) || password.length < 8 || !/[A-Za-z]/.test(password) || !/[0-9]/.test(password)) {
-      return send(res, 400, { error: 'Invalid registration details' });
-    }
-
-    if (await userByUsername(username)) {
-      return send(res, 409, { error: 'Username already exists' });
-    }
-
-    if (mobile) {
-      const mobileResult = await db.query('SELECT id FROM users WHERE mobile = $1', [mobile]);
-      if (mobileResult.rows.length) {
-        return send(res, 409, { error: 'Mobile number is already registered' });
-      }
-    }
-
-    const id = uid('USR');
-    await db.query(
-      `INSERT INTO users(id, name, username, mobile, role, password_hash, active, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6, TRUE, $7)`,
-      [id, name, username, mobile || null, role, hashPassword(password), now()]
-    );
-
-    return send(res, 201, { user: { id, name, username, mobile, role } });
-  }
-
   if (method === 'GET' && parts[1] === 'public' && parts[2] === 'branding') {
     const r = await db.query(`
       SELECT COALESCE(settings, '{}'::jsonb) AS settings
@@ -2518,6 +2487,46 @@ async function api(req, res) {
   }
 
   if (parts[1] === 'auth') {
+    if (method === 'POST' && parts[2] === 'register') {
+      const requester = await sessionUser(req);
+      const existing = await countUsers();
+      if (existing > 0 && (!requester || requester.role !== 'Administrator')) {
+        return send(res, 403, { error: 'Only the first account can self-register. An Administrator must create additional users.' });
+      }
+
+      const b = await readBody(req);
+      const name = String(b.name || '').trim().slice(0, 100);
+      const username = String(b.username || '').trim().toLowerCase();
+      const mobile = String(b.mobile || '').trim();
+      const role = String(b.role || '').trim();
+      const password = String(b.password || '');
+
+      if (existing === 0 && role !== 'Administrator') {
+        return send(res, 400, { error: 'The first account must be Administrator' });
+      }
+
+      if (!name || !/^[a-z0-9._-]{3,30}$/.test(username) || (mobile && !mobileOk(mobile)) ||
+        !ROLES.includes(role) || password.length < 8 || !/[A-Za-z]/.test(password) || !/[0-9]/.test(password)) {
+        return send(res, 400, { error: 'Invalid registration details' });
+      }
+
+      if (await userByUsername(username)) return send(res, 409, { error: 'Username already exists' });
+
+      if (mobile) {
+        const mobileResult = await db.query('SELECT id FROM users WHERE mobile = $1', [mobile]);
+        if (mobileResult.rows.length) return send(res, 409, { error: 'Mobile number is already registered' });
+      }
+
+      const id = uid('USR');
+      await db.query(
+        `INSERT INTO users(id, name, username, mobile, role, password_hash, active, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, TRUE, $7)`,
+        [id, name, username, mobile || null, role, hashPassword(password), now()]
+      );
+
+      return send(res, 201, { user: { id, name, username, mobile, role } });
+    }
+
     if (method === 'POST' && parts[2] === 'login') {
       if (rateLimited(req)) {
         return send(res, 429, { error: 'Too many login attempts. Please try again later.' }, { 'Retry-After': '900' });

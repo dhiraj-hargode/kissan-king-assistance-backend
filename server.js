@@ -356,13 +356,13 @@ async function initDb() {
 
   async function columnIsGenerated(table, column) {
     const r = await db.query(`
-      SELECT COALESCE(attgenerated, '') AS generated
+      SELECT COALESCE(attgenerated, '') AS generated, COALESCE(attidentity, '') AS identity_kind
       FROM pg_attribute
       WHERE attrelid = to_regclass($1)::oid
         AND attname = $2
         AND NOT attisdropped
     `, [`public.${table}`, column]);
-    return r.rows[0]?.generated === 's';
+    return r.rows[0]?.generated === 's' || r.rows[0]?.identity_kind === 'a' || r.rows[0]?.identity_kind === 'd';
   }
 
   async function backfillColumn(table, column, expression, defaultExpression = null) {
@@ -472,6 +472,10 @@ async function initDb() {
 
   // Repair all known legacy NULL/default violations in one idempotent pass.
   await repairLegacyNulls();
+
+  // Cache whether payments.total is generated/identity so all later writes
+  // omit it instead of attempting to insert/update a non-DEFAULT value.
+  paymentsTotalGenerated = await columnIsGenerated('payments', 'total');
 
   // Older app_settings tables may have used data_json instead of settings.
   await ensureColumn('app_settings', 'settings', "JSONB NOT NULL DEFAULT '{}'::jsonb");

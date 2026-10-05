@@ -1949,16 +1949,17 @@ async function api(req, res) {
 
   if (parts[1] === 'auth') {
     if (method === 'POST' && parts[2] === 'register') {
+      // Bootstrap-safe registration:
+      // - If the users table is empty, the first Administrator may register without a session.
+      // - Once a user exists, only an authenticated Administrator may create another user.
+      // Do NOT call sessionUser() during bootstrap; an empty database must never require auth.
       const existing = await countUsers();
-
+      let requester = null;
       if (existing > 0) {
-          const requester = await sessionUser(req);
-
-          if (!requester || requester.role !== 'Administrator') {
-              return send(res, 403, {
-                  error: 'Only an Administrator can create additional users.'
-              });
-          }
+        requester = await sessionUser(req);
+        if (!requester || requester.role !== 'Administrator') {
+          return send(res, 403, { error: 'Only an Administrator can create additional users.' });
+        }
       }
 
       const b = await readBody(req);
@@ -1991,7 +1992,15 @@ async function api(req, res) {
         [id, name, username, mobile || null, role, hashPassword(password), now()]
       );
 
-      return send(res, 201, { user: { id, name, username, mobile, role } });
+      // Bootstrap the very first Administrator into an authenticated session
+      // immediately. The frontend may call /api/auth/me after registration;
+      // without this session it would receive "Authentication required" even
+      // though the account was created successfully.
+      if (existing === 0) {
+        await setSession(res, id, true);
+      }
+
+      return send(res, 201, { user: { id, name, username, mobile, role }, bootstrap: existing === 0 });
     }
 
     if (method === 'POST' && parts[2] === 'login') {

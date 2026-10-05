@@ -355,6 +355,111 @@ async function initDb() {
   await db.query('CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id)');
   await db.query('CREATE INDEX IF NOT EXISTS idx_users_username ON users(username)');
 
+  // Existing databases may have been created with stricter NOT NULL constraints
+  // than the current CREATE TABLE definitions. Backfill legacy NULLs and add
+  // safe defaults so new normalized records cannot fail because a frontend
+  // omitted an optional/derived field.
+  await db.query(`
+    UPDATE customers
+    SET status = COALESCE(NULLIF(status, ''), 'ACTIVE'),
+        created_at = COALESCE(created_at, NOW()),
+        updated_at = COALESCE(updated_at, NOW()),
+        data_json = COALESCE(data_json, '{}'::jsonb)
+    WHERE status IS NULL OR status = '' OR created_at IS NULL OR updated_at IS NULL OR data_json IS NULL
+  `);
+  await db.query(`ALTER TABLE customers ALTER COLUMN status SET DEFAULT 'ACTIVE'`);
+  await db.query(`ALTER TABLE customers ALTER COLUMN created_at SET DEFAULT NOW()`);
+  await db.query(`ALTER TABLE customers ALTER COLUMN updated_at SET DEFAULT NOW()`);
+  await db.query(`ALTER TABLE customers ALTER COLUMN data_json SET DEFAULT '{}'::jsonb`);
+
+  await db.query(`
+    UPDATE loans
+    SET amount = COALESCE(amount, 0), rate = COALESCE(rate, 0), emi = COALESCE(emi, 0),
+        status = COALESCE(NULLIF(status, ''), 'ACTIVE'),
+        created_at = COALESCE(created_at, NOW()), updated_at = COALESCE(updated_at, NOW()),
+        data_json = COALESCE(data_json, '{}'::jsonb)
+    WHERE amount IS NULL OR rate IS NULL OR emi IS NULL OR status IS NULL OR status = ''
+       OR created_at IS NULL OR updated_at IS NULL OR data_json IS NULL
+  `);
+  await db.query(`ALTER TABLE loans ALTER COLUMN amount SET DEFAULT 0`);
+  await db.query(`ALTER TABLE loans ALTER COLUMN rate SET DEFAULT 0`);
+  await db.query(`ALTER TABLE loans ALTER COLUMN emi SET DEFAULT 0`);
+  await db.query(`ALTER TABLE loans ALTER COLUMN status SET DEFAULT 'ACTIVE'`);
+  await db.query(`ALTER TABLE loans ALTER COLUMN created_at SET DEFAULT NOW()`);
+  await db.query(`ALTER TABLE loans ALTER COLUMN updated_at SET DEFAULT NOW()`);
+  await db.query(`ALTER TABLE loans ALTER COLUMN data_json SET DEFAULT '{}'::jsonb`);
+
+  await db.query(`
+    UPDATE schedules
+    SET emi = COALESCE(emi, 0), principal = COALESCE(principal, 0), interest = COALESCE(interest, 0),
+        penalty = COALESCE(penalty, 0), paid = COALESCE(paid, 0), remaining = COALESCE(remaining, 0),
+        status = COALESCE(NULLIF(status, ''), 'PENDING'), manual_pending = COALESCE(manual_pending, FALSE),
+        data_json = COALESCE(data_json, '{}'::jsonb)
+    WHERE emi IS NULL OR principal IS NULL OR interest IS NULL OR penalty IS NULL OR paid IS NULL
+       OR remaining IS NULL OR status IS NULL OR status = '' OR manual_pending IS NULL OR data_json IS NULL
+  `);
+  await db.query(`ALTER TABLE schedules ALTER COLUMN emi SET DEFAULT 0`);
+  await db.query(`ALTER TABLE schedules ALTER COLUMN principal SET DEFAULT 0`);
+  await db.query(`ALTER TABLE schedules ALTER COLUMN interest SET DEFAULT 0`);
+  await db.query(`ALTER TABLE schedules ALTER COLUMN penalty SET DEFAULT 0`);
+  await db.query(`ALTER TABLE schedules ALTER COLUMN paid SET DEFAULT 0`);
+  await db.query(`ALTER TABLE schedules ALTER COLUMN remaining SET DEFAULT 0`);
+  await db.query(`ALTER TABLE schedules ALTER COLUMN status SET DEFAULT 'PENDING'`);
+  await db.query(`ALTER TABLE schedules ALTER COLUMN manual_pending SET DEFAULT FALSE`);
+  await db.query(`ALTER TABLE schedules ALTER COLUMN data_json SET DEFAULT '{}'::jsonb`);
+
+  await db.query(`
+    UPDATE payments
+    SET principal = COALESCE(principal, 0), interest = COALESCE(interest, 0), penalty = COALESCE(penalty, 0),
+        total = COALESCE(total, 0), created_at = COALESCE(created_at, NOW()),
+        activity_created_at = COALESCE(activity_created_at, created_at, NOW()),
+        data_json = COALESCE(data_json, '{}'::jsonb)
+    WHERE principal IS NULL OR interest IS NULL OR penalty IS NULL OR total IS NULL
+       OR created_at IS NULL OR activity_created_at IS NULL OR data_json IS NULL
+  `);
+  await db.query(`ALTER TABLE payments ALTER COLUMN principal SET DEFAULT 0`);
+  await db.query(`ALTER TABLE payments ALTER COLUMN interest SET DEFAULT 0`);
+  await db.query(`ALTER TABLE payments ALTER COLUMN penalty SET DEFAULT 0`);
+  await db.query(`ALTER TABLE payments ALTER COLUMN total SET DEFAULT 0`);
+  await db.query(`ALTER TABLE payments ALTER COLUMN created_at SET DEFAULT NOW()`);
+  await db.query(`ALTER TABLE payments ALTER COLUMN activity_created_at SET DEFAULT NOW()`);
+  await db.query(`ALTER TABLE payments ALTER COLUMN data_json SET DEFAULT '{}'::jsonb`);
+
+  await db.query(`
+    UPDATE blacklist
+    SET outstanding = COALESCE(outstanding, 0), created_at = COALESCE(created_at, NOW()),
+        data_json = COALESCE(data_json, '{}'::jsonb)
+    WHERE outstanding IS NULL OR created_at IS NULL OR data_json IS NULL
+  `);
+  await db.query(`ALTER TABLE blacklist ALTER COLUMN outstanding SET DEFAULT 0`);
+  await db.query(`ALTER TABLE blacklist ALTER COLUMN created_at SET DEFAULT NOW()`);
+  await db.query(`ALTER TABLE blacklist ALTER COLUMN data_json SET DEFAULT '{}'::jsonb`);
+
+  await db.query(`
+    UPDATE notifications
+    SET read = COALESCE(read, FALSE), created_at = COALESCE(created_at, NOW()),
+        data_json = COALESCE(data_json, '{}'::jsonb)
+    WHERE read IS NULL OR created_at IS NULL OR data_json IS NULL
+  `);
+  await db.query(`ALTER TABLE notifications ALTER COLUMN read SET DEFAULT FALSE`);
+  await db.query(`ALTER TABLE notifications ALTER COLUMN created_at SET DEFAULT NOW()`);
+  await db.query(`ALTER TABLE notifications ALTER COLUMN data_json SET DEFAULT '{}'::jsonb`);
+
+  await db.query(`
+    UPDATE deleted_records
+    SET deleted_at = COALESCE(deleted_at, NOW()), data_json = COALESCE(data_json, '{}'::jsonb)
+    WHERE deleted_at IS NULL OR data_json IS NULL
+  `);
+  await db.query(`ALTER TABLE deleted_records ALTER COLUMN deleted_at SET DEFAULT NOW()`);
+  await db.query(`ALTER TABLE deleted_records ALTER COLUMN data_json SET DEFAULT '{}'::jsonb`);
+
+  await db.query(`
+    UPDATE expired_customers
+    SET data_json = COALESCE(data_json, '{}'::jsonb)
+    WHERE data_json IS NULL
+  `);
+  await db.query(`ALTER TABLE expired_customers ALTER COLUMN data_json SET DEFAULT '{}'::jsonb`);
+
   // Normalized PostgreSQL is the only business-data source of truth.
   // Migrate application settings from the old user_data table once, if it
   // still exists, then remove the obsolete table. Never read business data
@@ -682,8 +787,8 @@ async function syncNormalizedOperations(client, data, operations) {
     `, [
       c.id, c.firstName || null, c.middleName || null, c.lastName || null, c.name || null,
       c.mobile || c.phone || null, c.alternateMobile || null, c.reference || c.customerReference || null,
-      c.address || null, c.city || null, c.district || null, c.pincode || null, c.status || null,
-      c.createdAt || null, c.updatedAt || null, JSON.stringify(c)
+      c.address || null, c.city || null, c.district || null, c.pincode || null,
+      String(c.status || 'ACTIVE').trim().toUpperCase(), c.createdAt || now(), c.updatedAt || c.createdAt || now(), JSON.stringify(c)
     ]);
   }
 

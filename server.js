@@ -218,8 +218,179 @@ function changes(before, after) {
     .flatMap(k => diff(before, after, k).map(([action, id]) => ({ action, type: k, id })));
 }
 
-// PostgreSQL database schema.
-let paymentsTotalGenerated = false;
+// PostgreSQL database schema and legacy-schema migration helpers.
+// The application must tolerate databases created by older versions.  Never
+// assume that CREATE TABLE IF NOT EXISTS upgrades an existing table.
+const NORMALIZED_TABLES = {
+  customers: {
+    id: 'TEXT PRIMARY KEY', first_name: 'TEXT', middle_name: 'TEXT', last_name: 'TEXT', name: 'TEXT',
+    mobile: 'TEXT', alternate_mobile: 'TEXT', reference: 'TEXT', address: 'TEXT', city: 'TEXT', district: 'TEXT', pincode: 'TEXT',
+    status: 'TEXT', created_at: 'TIMESTAMPTZ', updated_at: 'TIMESTAMPTZ', data_json: "JSONB NOT NULL DEFAULT '{}'::jsonb"
+  },
+  loans: {
+    id: 'TEXT PRIMARY KEY', customer_id: 'TEXT', khata_no: 'TEXT', loan_type: 'TEXT', loan_against: 'TEXT',
+    amount: 'NUMERIC(18,2) DEFAULT 0', rate: 'NUMERIC(10,4) DEFAULT 0', emi: 'NUMERIC(18,2) DEFAULT 0', emi_option: 'TEXT', start_date: 'DATE',
+    status: 'TEXT', created_at: 'TIMESTAMPTZ', updated_at: 'TIMESTAMPTZ', data_json: "JSONB NOT NULL DEFAULT '{}'::jsonb"
+  },
+  schedules: {
+    id: 'TEXT PRIMARY KEY', loan_id: 'TEXT', due_date: 'DATE', installment_no: 'INTEGER', emi: 'NUMERIC(18,2) DEFAULT 0',
+    principal: 'NUMERIC(18,2) DEFAULT 0', interest: 'NUMERIC(18,2) DEFAULT 0', penalty: 'NUMERIC(18,2) DEFAULT 0',
+    paid: 'NUMERIC(18,2) DEFAULT 0', remaining: 'NUMERIC(18,2) DEFAULT 0', status: 'TEXT', manual_pending: 'BOOLEAN DEFAULT FALSE',
+    pending_added_at: 'TIMESTAMPTZ', pending_added_by: 'TEXT', data_json: "JSONB NOT NULL DEFAULT '{}'::jsonb"
+  },
+  payments: {
+    id: 'TEXT PRIMARY KEY', loan_id: 'TEXT', schedule_id: 'TEXT', payment_date: 'DATE', principal: 'NUMERIC(18,2) DEFAULT 0',
+    interest: 'NUMERIC(18,2) DEFAULT 0', penalty: 'NUMERIC(18,2) DEFAULT 0', total: 'NUMERIC(18,2) DEFAULT 0', mode: 'TEXT', notes: 'TEXT',
+    created_at: 'TIMESTAMPTZ', activity_created_at: 'TIMESTAMPTZ', data_json: "JSONB NOT NULL DEFAULT '{}'::jsonb"
+  },
+  blacklist: {
+    id: 'TEXT PRIMARY KEY', customer_id: 'TEXT', reason: 'TEXT', blacklist_date: 'DATE', notes: 'TEXT', outstanding: 'NUMERIC(18,2) DEFAULT 0',
+    created_at: 'TIMESTAMPTZ', data_json: "JSONB NOT NULL DEFAULT '{}'::jsonb"
+  },
+  notifications: {
+    id: 'TEXT PRIMARY KEY', customer_id: 'TEXT', type: 'TEXT', title: 'TEXT', message: 'TEXT', read: 'BOOLEAN DEFAULT FALSE',
+    created_at: 'TIMESTAMPTZ', data_json: "JSONB NOT NULL DEFAULT '{}'::jsonb"
+  },
+  deleted_records: {
+    id: 'TEXT PRIMARY KEY', record_type: 'TEXT', record_id: 'TEXT', deleted_at: 'TIMESTAMPTZ', deleted_by: 'TEXT',
+    data_json: "JSONB NOT NULL DEFAULT '{}'::jsonb"
+  },
+  expired_customers: {
+    id: 'TEXT PRIMARY KEY', customer_id: 'TEXT', reason: 'TEXT', expired_date: 'DATE', notes: 'TEXT',
+    data_json: "JSONB NOT NULL DEFAULT '{}'::jsonb"
+  }
+};
+
+const SCALAR_DEFAULTS = {
+  customers: { status: 'ACTIVE', created_at: () => now(), updated_at: () => now() },
+  loans: { status: 'ACTIVE', created_at: () => now(), updated_at: () => now() },
+  schedules: { emi: 0, principal: 0, interest: 0, penalty: 0, paid: 0, remaining: 0, status: 'PENDING', manual_pending: false },
+  payments: { principal: 0, interest: 0, penalty: 0, created_at: () => now(), activity_created_at: () => now() },
+  blacklist: { outstanding: 0, created_at: () => now() },
+  notifications: { read: false, created_at: () => now() },
+  deleted_records: { deleted_at: () => now() },
+  expired_customers: { expired_date: () => new Date().toISOString().slice(0,10) }
+};
+
+async function tableColumns(executor, table, refresh = false) {
+  if (!refresh && tableColumns.cache?.has(table)) return tableColumns.cache.get(table);
+  const r = await executor.query(`
+    SELECT column_name, is_nullable, column_default, is_identity, identity_generation, is_generated, generation_expression
+    FROM information_schema.columns
+    WHERE table_schema = 'public' AND table_name = $1
+    ORDER BY ordinal_position
+  `, [table]);
+  const map = new Map(r.rows.map(x => [x.column_name, x]));
+  tableColumns.cache ||= new Map();
+  tableColumns.cache.set(table, map);
+  return map;
+}
+tableColumns.cache = new Map();
+
+function isDbManagedColumn(meta) {
+  return meta && (meta.is_identity === 'YES' || meta.is_generated === 'ALWAYS');
+}
+
+async function ensureLegacySchema(executor) {
+  for (const [table, columns] of Object.entries(NORMALIZED_TABLES)) {
+    for (const [column, definition] of Object.entries(columns)) {
+      if (column === 'id') continue;
+      await executor.query(`ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS ${column} ${definition}`);
+    }
+  }
+
+  tableColumns.cache.clear();
+  for (const table of Object.keys(NORMALIZED_TABLES)) {
+    const cols = await tableColumns(executor, table, true);
+    const defaults = SCALAR_DEFAULTS[table] || {};
+    for (const [column, value] of Object.entries(defaults)) {
+      const meta = cols.get(column);
+      if (!meta || isDbManagedColumn(meta)) continue;
+      const fallback = typeof value === 'function' ? value() : value;
+      await executor.query(`UPDATE ${table} SET ${column} = $1 WHERE ${column} IS NULL`, [fallback]);
+      if (!meta.column_default) {
+        try { await executor.query(`ALTER TABLE ${table} ALTER COLUMN ${column} SET DEFAULT $1`, [fallback]); } catch { /* generated/legacy definitions may reject defaults */ }
+      }
+    }
+
+    // data_json is the compatibility payload consumed by the application.
+    const jsonMeta = cols.get('data_json');
+    if (jsonMeta && !isDbManagedColumn(jsonMeta)) {
+      await executor.query(`UPDATE ${table} SET data_json = '{}'::jsonb WHERE data_json IS NULL`);
+    }
+  }
+
+  // Repair the legacy app_settings table without replacing user settings.
+  const appCols = await tableColumns(executor, 'app_settings', true);
+  if (appCols.has('data_json') && !appCols.has('settings')) {
+    await executor.query(`ALTER TABLE app_settings ADD COLUMN settings JSONB`);
+    await executor.query(`UPDATE app_settings SET settings = COALESCE(data_json, '{}'::jsonb) WHERE settings IS NULL`);
+    await executor.query(`ALTER TABLE app_settings ALTER COLUMN settings SET DEFAULT '{}'::jsonb`);
+  } else if (!appCols.has('settings')) {
+    await executor.query(`ALTER TABLE app_settings ADD COLUMN settings JSONB DEFAULT '{}'::jsonb`);
+  }
+  await executor.query(`UPDATE app_settings SET settings = '{}'::jsonb WHERE settings IS NULL`);
+  try { await executor.query(`ALTER TABLE app_settings ALTER COLUMN settings SET NOT NULL`); } catch { }
+
+  tableColumns.cache.clear();
+  console.log('Legacy PostgreSQL schema migration completed.');
+}
+
+function jsonValue(v) {
+  return v == null ? null : JSON.stringify(v);
+}
+
+function normalizedRow(type, record) {
+  const r = record && typeof record === 'object' ? record : {};
+  const created = r.createdAt || r.created_at || now();
+  const updated = r.updatedAt || r.updated_at || created || now();
+  const out = {
+    customers: {
+      id:r.id, first_name:r.firstName, middle_name:r.middleName, last_name:r.lastName, name:r.name,
+      mobile:r.mobile || r.phone, alternate_mobile:r.alternateMobile || r.alternate_mobile, reference:r.reference || r.customerReference,
+      address:r.address, city:r.city || r.village, district:r.district, pincode:r.pincode, status:r.status || 'ACTIVE',
+      created_at:created, updated_at:updated, data_json:jsonValue(r)
+    },
+    loans: {
+      id:r.id, customer_id:r.customerId || r.customer_id, khata_no:r.khataNo || r.khata_no || r.legacyKhataNo || r.legacy_khata_no,
+      loan_type:r.loanType || r.loan_type, loan_against:r.loanAgainst || r.loan_against, amount:Number(r.amount || 0),
+      rate:Number(r.interestRate ?? r.rate ?? 0), emi:Number(r.emi || 0), emi_option:r.emiOption || r.emi_option,
+      start_date:r.startDate || r.start_date, status:r.status || 'ACTIVE', created_at:created, updated_at:updated, data_json:jsonValue(r)
+    },
+    schedules: {
+      id:r.id, loan_id:r.loanId || r.loan_id, due_date:r.dueDate || r.due_date,
+      installment_no:r.installment ?? r.installmentNo ?? r.installment_no, emi:Number(r.emi || 0), principal:Number(r.principal || 0),
+      interest:Number(r.interest || 0), penalty:Number(r.penalty || 0), paid:Number(r.paid || 0), remaining:Number(r.remaining || 0),
+      status:r.status || 'PENDING', manual_pending:Boolean(r.manualPending ?? r.manual_pending),
+      pending_added_at:r.pendingAddedAt || r.pending_added_at, pending_added_by:r.pendingAddedBy || r.pending_added_by, data_json:jsonValue(r)
+    },
+    payments: {
+      id:r.id, loan_id:r.loanId || r.loan_id, schedule_id:r.scheduleId || r.schedule_id,
+      payment_date:r.date || r.paymentDate || r.payment_date, principal:Number(r.principal || 0), interest:Number(r.interest || 0),
+      penalty:Number(r.penalty || 0), total:Number(r.total ?? (Number(r.principal||0)+Number(r.interest||0)+Number(r.penalty||0))),
+      mode:r.mode, notes:r.notes, created_at:created, activity_created_at:r.activityCreatedAt || r.activity_created_at || created, data_json:jsonValue(r)
+    },
+    blacklist: { id:r.id, customer_id:r.customerId || r.customer_id, reason:r.reason, blacklist_date:r.date || r.blacklistDate || r.blacklist_date, notes:r.notes, outstanding:Number(r.outstanding || 0), created_at:created, data_json:jsonValue(r) },
+    notifications: { id:r.id, customer_id:r.customerId || r.customer_id, type:r.type, title:r.title, message:r.message, read:Boolean(r.read), created_at:created, data_json:jsonValue(r) },
+    deleted_records: { id:r.id, record_type:r.recordType || r.record_type, record_id:r.recordId || r.record_id, deleted_at:r.deletedAt || r.deleted_at || created, deleted_by:r.deletedBy || r.deleted_by, data_json:jsonValue(r) },
+    expired_customers: { id:r.id, customer_id:r.customerId || r.customer_id, reason:r.reason || r.status, expired_date:r.date || r.expiredDate || r.expired_date || new Date().toISOString().slice(0,10), notes:r.notes, data_json:jsonValue(r) }
+  }[type];
+  return out || {};
+}
+
+async function upsertNormalizedRow(client, type, record) {
+  const table = type === 'expiredCustomers' ? 'expired_customers' : type === 'deletedRecords' ? 'deleted_records' : type;
+  const row = normalizedRow(type, record);
+  const cols = await tableColumns(client, table);
+  const writable = Object.keys(row).filter(c => cols.has(c) && !isDbManagedColumn(cols.get(c)));
+  const values = writable.map(c => row[c]);
+  const placeholders = writable.map((c,i) => `$${i+1}${c === 'data_json' ? '::jsonb' : ''}`);
+  const updates = writable.filter(c => c !== 'id').map(c => `${c}=EXCLUDED.${c}`);
+  if (!writable.includes('id') || !values[0]) throw new Error(`Missing ${type} id`);
+  const sql = `INSERT INTO ${table} (${writable.join(',')}) VALUES (${placeholders.join(',')}) ON CONFLICT (id) DO ${updates.length ? `UPDATE SET ${updates.join(',')}` : 'NOTHING'}`;
+  await client.query(sql, values);
+}
+
 async function initDb() {
   await db.query(`
     CREATE TABLE IF NOT EXISTS users (
@@ -338,158 +509,7 @@ async function initDb() {
     )
   `);
 
-
-  // Legacy-schema compatibility migration.
-  // Existing PostgreSQL tables are not changed by CREATE TABLE IF NOT EXISTS,
-  // so older deployments may be missing columns or may have generated columns.
-  // Add only missing columns and backfill only ordinary (non-generated) columns.
-  async function ensureColumn(table, column, definition) {
-    const exists = await db.query(`
-      SELECT 1
-      FROM information_schema.columns
-      WHERE table_schema = 'public' AND table_name = $1 AND column_name = $2
-    `, [table, column]);
-    if (!exists.rows.length) {
-      await db.query(`ALTER TABLE "${table}" ADD COLUMN "${column}" ${definition}`);
-    }
-  }
-
-  async function columnIsGenerated(table, column) {
-    const r = await db.query(`
-      SELECT COALESCE(attgenerated, '') AS generated, COALESCE(attidentity, '') AS identity_kind
-      FROM pg_attribute
-      WHERE attrelid = to_regclass($1)::oid
-        AND attname = $2
-        AND NOT attisdropped
-    `, [`public.${table}`, column]);
-    return r.rows[0]?.generated === 's' || r.rows[0]?.identity_kind === 'a' || r.rows[0]?.identity_kind === 'd';
-  }
-
-  async function backfillColumn(table, column, expression, defaultExpression = null) {
-    if (await columnIsGenerated(table, column)) return;
-    if (defaultExpression) {
-      await db.query(`ALTER TABLE "${table}" ALTER COLUMN "${column}" SET DEFAULT ${defaultExpression}`);
-    }
-    await db.query(`UPDATE "${table}" SET "${column}" = ${expression} WHERE "${column}" IS NULL`);
-  }
-
-  // Repair legacy NOT NULL/default mismatches without touching generated columns.
-  // Existing deployments can have stricter constraints than the current model;
-  // keep those constraints, but make every application-managed optional field safe.
-  async function repairLegacyNulls() {
-    const rules = [
-      ['customers','status',"'ACTIVE'","'ACTIVE'"], ['customers','created_at','NOW()','NOW()'], ['customers','updated_at','NOW()','NOW()'],
-      ['customers','data_json',"'{}'::jsonb","'{}'::jsonb"],
-      ['loans','amount','0','0'], ['loans','rate','0','0'], ['loans','emi','0','0'], ['loans','status',"'ACTIVE'","'ACTIVE'"],
-      ['loans','created_at','NOW()','NOW()'], ['loans','updated_at','NOW()','NOW()'], ['loans','data_json',"'{}'::jsonb","'{}'::jsonb"],
-      ['schedules','emi','0','0'], ['schedules','principal','0','0'], ['schedules','interest','0','0'], ['schedules','penalty','0','0'],
-      ['schedules','paid','0','0'], ['schedules','remaining','0','0'], ['schedules','status',"'PENDING'","'PENDING'"],
-      ['schedules','manual_pending','FALSE','FALSE'], ['schedules','data_json',"'{}'::jsonb","'{}'::jsonb"],
-      ['payments','principal','0','0'], ['payments','interest','0','0'], ['payments','penalty','0','0'],
-      ['payments','created_at','NOW()','NOW()'], ['payments','activity_created_at','NOW()','NOW()'], ['payments','data_json',"'{}'::jsonb","'{}'::jsonb"],
-      ['blacklist','outstanding','0','0'], ['blacklist','created_at','NOW()','NOW()'], ['blacklist','data_json',"'{}'::jsonb","'{}'::jsonb"],
-      ['notifications','read','FALSE','FALSE'], ['notifications','created_at','NOW()','NOW()'], ['notifications','data_json',"'{}'::jsonb","'{}'::jsonb"],
-      ['deleted_records','deleted_at','NOW()','NOW()'], ['deleted_records','data_json',"'{}'::jsonb","'{}'::jsonb"],
-      ['expired_customers','expired_date','CURRENT_DATE','CURRENT_DATE'], ['expired_customers','data_json',"'{}'::jsonb","'{}'::jsonb"]
-    ];
-    for (const [table, column, expr, def] of rules) {
-      const exists = await db.query(`SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name=$1 AND column_name=$2`, [table,column]);
-      if (exists.rows.length && !(await columnIsGenerated(table,column))) {
-        await db.query(`ALTER TABLE "${table}" ALTER COLUMN "${column}" SET DEFAULT ${def}`);
-        await db.query(`UPDATE "${table}" SET "${column}" = ${expr} WHERE "${column}" IS NULL`);
-      }
-    }
-    // Never attempt to update a generated payment.total. If it is an ordinary
-    // column, make it safe for old rows and future inserts.
-    if (!(await columnIsGenerated('payments','total'))) {
-      await db.query(`ALTER TABLE payments ALTER COLUMN total SET DEFAULT 0`);
-      await db.query(`UPDATE payments SET total = COALESCE(principal,0)+COALESCE(interest,0)+COALESCE(penalty,0) WHERE total IS NULL`);
-    }
-  }
-
-  // Add columns used by the current normalized model when an older database
-  // was created before those columns existed.
-  await ensureColumn('customers', 'status', "TEXT DEFAULT 'ACTIVE'");
-  await ensureColumn('customers', 'created_at', 'TIMESTAMPTZ');
-  await ensureColumn('customers', 'updated_at', 'TIMESTAMPTZ');
-  await ensureColumn('customers', 'data_json', "JSONB NOT NULL DEFAULT '{}'::jsonb");
-
-  await ensureColumn('loans', 'amount', 'NUMERIC(18,2) NOT NULL DEFAULT 0');
-  await ensureColumn('loans', 'rate', 'NUMERIC(10,4) DEFAULT 0');
-  await ensureColumn('loans', 'emi', 'NUMERIC(18,2) DEFAULT 0');
-  await ensureColumn('loans', 'status', "TEXT DEFAULT 'ACTIVE'");
-  await ensureColumn('loans', 'created_at', 'TIMESTAMPTZ');
-  await ensureColumn('loans', 'updated_at', 'TIMESTAMPTZ');
-  await ensureColumn('loans', 'data_json', "JSONB NOT NULL DEFAULT '{}'::jsonb");
-
-  await ensureColumn('schedules', 'emi', 'NUMERIC(18,2) DEFAULT 0');
-  await ensureColumn('schedules', 'principal', 'NUMERIC(18,2) DEFAULT 0');
-  await ensureColumn('schedules', 'interest', 'NUMERIC(18,2) DEFAULT 0');
-  await ensureColumn('schedules', 'penalty', 'NUMERIC(18,2) DEFAULT 0');
-  await ensureColumn('schedules', 'paid', 'NUMERIC(18,2) DEFAULT 0');
-  await ensureColumn('schedules', 'remaining', 'NUMERIC(18,2) DEFAULT 0');
-  await ensureColumn('schedules', 'status', "TEXT DEFAULT 'PENDING'");
-  await ensureColumn('schedules', 'manual_pending', 'BOOLEAN DEFAULT FALSE');
-  await ensureColumn('schedules', 'pending_added_at', 'TIMESTAMPTZ');
-  await ensureColumn('schedules', 'pending_added_by', 'TEXT');
-  await ensureColumn('schedules', 'data_json', "JSONB NOT NULL DEFAULT '{}'::jsonb");
-
-  await ensureColumn('payments', 'principal', 'NUMERIC(18,2) DEFAULT 0');
-  await ensureColumn('payments', 'interest', 'NUMERIC(18,2) DEFAULT 0');
-  await ensureColumn('payments', 'penalty', 'NUMERIC(18,2) DEFAULT 0');
-  await ensureColumn('payments', 'total', 'NUMERIC(18,2) DEFAULT 0');
-  await ensureColumn('payments', 'payment_date', 'DATE');
-  await ensureColumn('payments', 'mode', 'TEXT');
-  await ensureColumn('payments', 'notes', 'TEXT');
-  await ensureColumn('payments', 'created_at', 'TIMESTAMPTZ');
-  await ensureColumn('payments', 'activity_created_at', 'TIMESTAMPTZ');
-  await ensureColumn('payments', 'data_json', "JSONB NOT NULL DEFAULT '{}'::jsonb");
-
-  await ensureColumn('blacklist', 'reason', 'TEXT');
-  await ensureColumn('blacklist', 'blacklist_date', 'DATE');
-  await ensureColumn('blacklist', 'notes', 'TEXT');
-  await ensureColumn('blacklist', 'outstanding', 'NUMERIC(18,2) DEFAULT 0');
-  await ensureColumn('blacklist', 'created_at', 'TIMESTAMPTZ');
-  await ensureColumn('blacklist', 'data_json', "JSONB NOT NULL DEFAULT '{}'::jsonb");
-
-  await ensureColumn('notifications', 'type', 'TEXT');
-  await ensureColumn('notifications', 'title', 'TEXT');
-  await ensureColumn('notifications', 'message', 'TEXT');
-  await ensureColumn('notifications', 'read', 'BOOLEAN DEFAULT FALSE');
-  await ensureColumn('notifications', 'created_at', 'TIMESTAMPTZ');
-  await ensureColumn('notifications', 'data_json', "JSONB NOT NULL DEFAULT '{}'::jsonb");
-
-  await ensureColumn('deleted_records', 'record_type', 'TEXT');
-  await ensureColumn('deleted_records', 'record_id', 'TEXT');
-  await ensureColumn('deleted_records', 'deleted_at', 'TIMESTAMPTZ');
-  await ensureColumn('deleted_records', 'deleted_by', 'TEXT');
-  await ensureColumn('deleted_records', 'data_json', "JSONB NOT NULL DEFAULT '{}'::jsonb");
-
-  await ensureColumn('expired_customers', 'reason', 'TEXT');
-  await ensureColumn('expired_customers', 'expired_date', 'DATE');
-  await ensureColumn('expired_customers', 'notes', 'TEXT');
-  await ensureColumn('expired_customers', 'data_json', "JSONB NOT NULL DEFAULT '{}'::jsonb");
-
-  // Repair all known legacy NULL/default violations in one idempotent pass.
-  await repairLegacyNulls();
-
-  // Cache whether payments.total is generated/identity so all later writes
-  // omit it instead of attempting to insert/update a non-DEFAULT value.
-  paymentsTotalGenerated = await columnIsGenerated('payments', 'total');
-
-  // Older app_settings tables may have used data_json instead of settings.
-  await ensureColumn('app_settings', 'settings', "JSONB NOT NULL DEFAULT '{}'::jsonb");
-  const hasLegacySettings = await db.query(`
-    SELECT 1 FROM information_schema.columns
-    WHERE table_schema = 'public' AND table_name = 'app_settings' AND column_name = 'data_json'
-  `);
-  if (hasLegacySettings.rows.length && !(await columnIsGenerated('app_settings', 'settings'))) {
-    await db.query(`
-      UPDATE app_settings
-      SET settings = COALESCE(NULLIF(settings, '{}'::jsonb), data_json, '{}'::jsonb)
-      WHERE data_json IS NOT NULL
-    `);
-  }
+  await ensureLegacySchema(db);
 
   await db.query('CREATE INDEX IF NOT EXISTS idx_customers_name ON customers(name, first_name, last_name)');
   await db.query('CREATE INDEX IF NOT EXISTS idx_customers_mobile ON customers(mobile)');
@@ -654,297 +674,52 @@ async function loadNormalizedData(executor = db) {
 
 async function syncNormalizedFull(client, data) {
   const source = normalizeData(data);
-  const j = JSON.stringify;
-
-  // Dependency order matters because normalized tables use foreign keys.
   await client.query('TRUNCATE TABLE payments, schedules, blacklist, notifications, deleted_records, expired_customers, loans, customers CASCADE');
+  for (const c of source.customers) await upsertNormalizedRow(client, 'customers', c);
+  for (const l of source.loans) await upsertNormalizedRow(client, 'loans', l);
+  for (const sc of source.schedules) await upsertNormalizedRow(client, 'schedules', sc);
+  for (const p of source.payments) await upsertNormalizedRow(client, 'payments', p);
+  for (const b of source.blacklist) await upsertNormalizedRow(client, 'blacklist', b);
+  for (const n of source.notifications) await upsertNormalizedRow(client, 'notifications', n);
+  for (const d of source.deletedRecords) await upsertNormalizedRow(client, 'deletedRecords', d);
+  for (const ex of source.expiredCustomers) await upsertNormalizedRow(client, 'expiredCustomers', ex);
+  await replacePendingQueue(client, source.pendingQueue || []);
+}
 
-  await client.query(`
-    INSERT INTO customers
-      (id, first_name, middle_name, last_name, name, mobile, alternate_mobile, reference, address, city, district, pincode, status, created_at, updated_at, data_json)
-    SELECT
-      src.raw->>'id',
-      COALESCE(NULLIF(src.raw->>'firstName',''), NULLIF(src.raw->>'first_name','')),
-      COALESCE(NULLIF(src.raw->>'middleName',''), NULLIF(src.raw->>'middle_name','')),
-      COALESCE(NULLIF(src.raw->>'lastName',''), NULLIF(src.raw->>'last_name','')),
-      src.raw->>'name',
-      COALESCE(NULLIF(src.raw->>'mobile',''), NULLIF(src.raw->>'phone','')),
-      COALESCE(NULLIF(src.raw->>'alternateMobile',''), NULLIF(src.raw->>'alternate_mobile','')),
-      COALESCE(NULLIF(src.raw->>'reference',''), NULLIF(src.raw->>'customerReference','')),
-      src.raw->>'address', src.raw->>'city', src.raw->>'district', src.raw->>'pincode', COALESCE(NULLIF(src.raw->>'status',''), 'ACTIVE'),
-      COALESCE(NULLIF(COALESCE(src.raw->>'createdAt', src.raw->>'created_at'), '')::timestamptz, NOW()),
-      COALESCE(NULLIF(COALESCE(src.raw->>'updatedAt', src.raw->>'updated_at'), '')::timestamptz, NOW()),
-      src.raw
-    FROM jsonb_array_elements($1::jsonb) AS src(raw)
-    WHERE NULLIF(src.raw->>'id','') IS NOT NULL
-  `, [j(source.customers)]);
-
-  await client.query(`
-    INSERT INTO loans
-      (id, customer_id, khata_no, loan_type, loan_against, amount, rate, emi, emi_option, start_date, status, created_at, updated_at, data_json)
-    SELECT
-      src.raw->>'id',
-      COALESCE(NULLIF(src.raw->>'customerId',''), NULLIF(src.raw->>'customer_id','')),
-      COALESCE(NULLIF(src.raw->>'khataNo',''), NULLIF(src.raw->>'khata_no',''), NULLIF(src.raw->>'legacyKhataNo',''), NULLIF(src.raw->>'legacy_khata_no','')),
-      COALESCE(NULLIF(src.raw->>'loanType',''), NULLIF(src.raw->>'loan_type','')),
-      COALESCE(NULLIF(src.raw->>'loanAgainst',''), NULLIF(src.raw->>'loan_against','')),
-      COALESCE(NULLIF(src.raw->>'amount','')::numeric, 0),
-      COALESCE(NULLIF(src.raw->>'interestRate','')::numeric, NULLIF(src.raw->>'rate','')::numeric, 0),
-      COALESCE(NULLIF(src.raw->>'emi','')::numeric, 0),
-      COALESCE(NULLIF(src.raw->>'emiOption',''), NULLIF(src.raw->>'emi_option','')),
-      NULLIF(COALESCE(src.raw->>'startDate', src.raw->>'start_date'),'')::date,
-      COALESCE(NULLIF(src.raw->>'status',''), 'ACTIVE'),
-      COALESCE(NULLIF(COALESCE(src.raw->>'createdAt', src.raw->>'created_at'), '')::timestamptz, NOW()),
-      COALESCE(NULLIF(COALESCE(src.raw->>'updatedAt', src.raw->>'updated_at'), '')::timestamptz, NOW()),
-      src.raw
-    FROM jsonb_array_elements($1::jsonb) AS src(raw)
-    WHERE NULLIF(src.raw->>'id','') IS NOT NULL
-  `, [j(source.loans)]);
-
-  await client.query(`
-    INSERT INTO schedules
-      (id, loan_id, due_date, installment_no, emi, principal, interest, penalty, paid, remaining, status, manual_pending, pending_added_at, pending_added_by, data_json)
-    SELECT
-      src.raw->>'id',
-      COALESCE(NULLIF(src.raw->>'loanId',''), NULLIF(src.raw->>'loan_id','')),
-      NULLIF(COALESCE(src.raw->>'dueDate', src.raw->>'due_date'),'')::date,
-      COALESCE(NULLIF(src.raw->>'installment','')::int, NULLIF(src.raw->>'installmentNo','')::int, NULLIF(src.raw->>'installment_no','')::int),
-      COALESCE(NULLIF(src.raw->>'emi','')::numeric, 0),
-      COALESCE(NULLIF(src.raw->>'principal','')::numeric, 0),
-      COALESCE(NULLIF(src.raw->>'interest','')::numeric, 0),
-      COALESCE(NULLIF(src.raw->>'penalty','')::numeric, 0),
-      COALESCE(NULLIF(src.raw->>'paid','')::numeric, 0),
-      COALESCE(NULLIF(src.raw->>'remaining','')::numeric, 0),
-      COALESCE(NULLIF(src.raw->>'status',''), 'PENDING'),
-      COALESCE(NULLIF(src.raw->>'manualPending','')::boolean, NULLIF(src.raw->>'manual_pending','')::boolean, false),
-      NULLIF(COALESCE(src.raw->>'pendingAddedAt', src.raw->>'pending_added_at'),'')::timestamptz,
-      COALESCE(NULLIF(src.raw->>'pendingAddedBy',''), NULLIF(src.raw->>'pending_added_by','')),
-      src.raw
-    FROM jsonb_array_elements($1::jsonb) AS src(raw)
-    WHERE NULLIF(src.raw->>'id','') IS NOT NULL
-  `, [j(source.schedules)]);
-
-  if (paymentsTotalGenerated) {
-    await client.query(`
-      INSERT INTO payments
-        (id, loan_id, schedule_id, payment_date, principal, interest, penalty, mode, notes, created_at, activity_created_at, data_json)
-      SELECT
-        src.raw->>'id',
-        COALESCE(NULLIF(src.raw->>'loanId',''), NULLIF(src.raw->>'loan_id','')),
-        NULLIF(COALESCE(src.raw->>'scheduleId', src.raw->>'schedule_id'),''),
-        NULLIF(COALESCE(src.raw->>'date', src.raw->>'paymentDate', src.raw->>'payment_date'),'')::date,
-        COALESCE(NULLIF(src.raw->>'principal','')::numeric, 0),
-        COALESCE(NULLIF(src.raw->>'interest','')::numeric, 0),
-        COALESCE(NULLIF(src.raw->>'penalty','')::numeric, 0),
-        src.raw->>'mode', src.raw->>'notes',
-        COALESCE(NULLIF(COALESCE(src.raw->>'createdAt', src.raw->>'created_at'), '')::timestamptz, NOW()),
-        COALESCE(NULLIF(COALESCE(src.raw->>'activityCreatedAt', src.raw->>'activity_created_at'), '')::timestamptz, NOW()),
-        src.raw
-      FROM jsonb_array_elements($1::jsonb) AS src(raw)
-      WHERE NULLIF(src.raw->>'id','') IS NOT NULL
-    `, [j(source.payments)]);
-  } else {
-    await client.query(`
-      INSERT INTO payments
-        (id, loan_id, schedule_id, payment_date, principal, interest, penalty, total, mode, notes, created_at, activity_created_at, data_json)
-      SELECT
-        src.raw->>'id',
-        COALESCE(NULLIF(src.raw->>'loanId',''), NULLIF(src.raw->>'loan_id','')),
-        NULLIF(COALESCE(src.raw->>'scheduleId', src.raw->>'schedule_id'),''),
-        NULLIF(COALESCE(src.raw->>'date', src.raw->>'paymentDate', src.raw->>'payment_date'),'')::date,
-        COALESCE(NULLIF(src.raw->>'principal','')::numeric, 0),
-        COALESCE(NULLIF(src.raw->>'interest','')::numeric, 0),
-        COALESCE(NULLIF(src.raw->>'penalty','')::numeric, 0),
-        COALESCE(NULLIF(src.raw->>'total','')::numeric, 0),
-        src.raw->>'mode', src.raw->>'notes',
-        COALESCE(NULLIF(COALESCE(src.raw->>'createdAt', src.raw->>'created_at'), '')::timestamptz, NOW()),
-        COALESCE(NULLIF(COALESCE(src.raw->>'activityCreatedAt', src.raw->>'activity_created_at'), '')::timestamptz, NOW()),
-        src.raw
-      FROM jsonb_array_elements($1::jsonb) AS src(raw)
-      WHERE NULLIF(src.raw->>'id','') IS NOT NULL
-    `, [j(source.payments)]);
+async function replacePendingQueue(client, pendingIds) {
+  const cols = await tableColumns(client, 'schedules');
+  if (cols.has('manual_pending') && !isDbManagedColumn(cols.get('manual_pending'))) {
+    await client.query(`UPDATE schedules SET manual_pending = (id = ANY($1::text[]))`, [pendingIds.map(String)]);
   }
-
-  await client.query(`
-    INSERT INTO blacklist (id, customer_id, reason, blacklist_date, notes, outstanding, created_at, data_json)
-    SELECT src.raw->>'id',
-      COALESCE(NULLIF(src.raw->>'customerId',''), NULLIF(src.raw->>'customer_id','')),
-      src.raw->>'reason',
-      NULLIF(COALESCE(src.raw->>'date', src.raw->>'blacklistDate', src.raw->>'blacklist_date'),'')::date,
-      src.raw->>'notes', COALESCE(NULLIF(src.raw->>'outstanding','')::numeric,0),
-      NULLIF(COALESCE(src.raw->>'createdAt', src.raw->>'created_at'),'')::timestamptz, src.raw
-    FROM jsonb_array_elements($1::jsonb) AS src(raw)
-    WHERE NULLIF(src.raw->>'id','') IS NOT NULL
-  `, [j(source.blacklist)]);
-
-  await client.query(`
-    INSERT INTO notifications (id, customer_id, type, title, message, read, created_at, data_json)
-    SELECT src.raw->>'id', NULLIF(COALESCE(src.raw->>'customerId', src.raw->>'customer_id'),'') ,
-      src.raw->>'type', src.raw->>'title', src.raw->>'message',
-      COALESCE(NULLIF(src.raw->>'read','')::boolean, false),
-      NULLIF(COALESCE(src.raw->>'createdAt', src.raw->>'created_at'),'')::timestamptz, src.raw
-    FROM jsonb_array_elements($1::jsonb) AS src(raw)
-    WHERE NULLIF(src.raw->>'id','') IS NOT NULL
-  `, [j(source.notifications)]);
-
-  await client.query(`
-    INSERT INTO deleted_records (id, record_type, record_id, deleted_at, deleted_by, data_json)
-    SELECT src.raw->>'id', COALESCE(NULLIF(src.raw->>'recordType',''), NULLIF(src.raw->>'record_type','')),
-      COALESCE(NULLIF(src.raw->>'recordId',''), NULLIF(src.raw->>'record_id','')),
-      NULLIF(COALESCE(src.raw->>'deletedAt', src.raw->>'deleted_at'),'')::timestamptz,
-      COALESCE(NULLIF(src.raw->>'deletedBy',''), NULLIF(src.raw->>'deleted_by','')), src.raw
-    FROM jsonb_array_elements($1::jsonb) AS src(raw)
-    WHERE NULLIF(src.raw->>'id','') IS NOT NULL
-  `, [j(source.deletedRecords)]);
-
-  await client.query(`
-    INSERT INTO expired_customers (id, customer_id, reason, expired_date, notes, data_json)
-    SELECT src.raw->>'id', COALESCE(NULLIF(src.raw->>'customerId',''), NULLIF(src.raw->>'customer_id','')),
-      COALESCE(NULLIF(src.raw->>'reason',''), NULLIF(src.raw->>'status','')),
-      NULLIF(COALESCE(src.raw->>'date', src.raw->>'expiredDate', src.raw->>'expired_date'),'')::date,
-      src.raw->>'notes', src.raw
-    FROM jsonb_array_elements($1::jsonb) AS src(raw)
-    WHERE NULLIF(src.raw->>'id','') IS NOT NULL
-  `, [j(source.expiredCustomers)]);
+  if (cols.has('data_json') && !isDbManagedColumn(cols.get('data_json'))) {
+    await client.query(`
+      UPDATE schedules
+      SET data_json = jsonb_set(COALESCE(data_json,'{}'::jsonb), '{manualPending}', to_jsonb(COALESCE(manual_pending,false)), true)
+    `);
+  }
 }
 
 async function syncNormalizedOperations(client, data, operations) {
-  const groups = {
-    customers: [], loans: [], schedules: [], payments: [], blacklist: [],
-    notifications: [], deletedRecords: [], expiredCustomers: []
-  };
-  const deletes = {
-    customers: [], loans: [], schedules: [], payments: [], blacklist: [],
-    notifications: [], deletedRecords: [], expiredCustomers: []
-  };
-  let replacePendingQueue = false;
-
+  const groups = { customers: [], loans: [], schedules: [], payments: [], blacklist: [], notifications: [], deletedRecords: [], expiredCustomers: [] };
+  const deletes = { customers: [], loans: [], schedules: [], payments: [], blacklist: [], notifications: [], deletedRecords: [], expiredCustomers: [] };
+  let replacePending = false;
   for (const op of operations) {
     const type = String(op.type || '');
     const action = String(op.action || '');
-    if (type === 'pendingQueue' && action === 'replace') {
-      replacePendingQueue = true;
-      continue;
-    }
+    if (type === 'pendingQueue' && action === 'replace') { replacePending = true; continue; }
     if (!groups[type]) continue;
     const id = String(op.id ?? op.record?.id ?? '');
     if (!id) continue;
-    if (action === 'create' || action === 'update') groups[type].push(op.record);
+    if (action === 'create' || action === 'update') groups[type].push(op.record || {});
     else if (action === 'delete') deletes[type].push(id);
   }
 
-  // Deletes first for independent child records; customer/loan deletes use FK
-  // cascades and therefore happen after explicit child deletions.
-  for (const type of ['payments', 'schedules', 'blacklist', 'notifications', 'expiredCustomers', 'loans', 'customers', 'deletedRecords']) {
-    for (const id of deletes[type]) {
-      const table = type === 'expiredCustomers' ? 'expired_customers' :
-        type === 'deletedRecords' ? 'deleted_records' : type;
-      await client.query(`DELETE FROM ${table} WHERE id = $1`, [id]);
-    }
+  for (const type of ['payments','schedules','blacklist','notifications','expiredCustomers','loans','customers','deletedRecords']) {
+    const table = type === 'expiredCustomers' ? 'expired_customers' : type === 'deletedRecords' ? 'deleted_records' : type;
+    for (const id of deletes[type]) await client.query(`DELETE FROM ${table} WHERE id = $1`, [id]);
   }
-
-  for (const c of groups.customers) {
-    await client.query(`
-      INSERT INTO customers
-        (id, first_name, middle_name, last_name, name, mobile, alternate_mobile, reference, address, city, district, pincode, status, created_at, updated_at, data_json)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16::jsonb)
-      ON CONFLICT (id) DO UPDATE SET
-        first_name=EXCLUDED.first_name, middle_name=EXCLUDED.middle_name, last_name=EXCLUDED.last_name,
-        name=EXCLUDED.name, mobile=EXCLUDED.mobile, alternate_mobile=EXCLUDED.alternate_mobile,
-        reference=EXCLUDED.reference, address=EXCLUDED.address, city=EXCLUDED.city, district=EXCLUDED.district,
-        pincode=EXCLUDED.pincode, status=EXCLUDED.status, created_at=EXCLUDED.created_at,
-        updated_at=EXCLUDED.updated_at, data_json=EXCLUDED.data_json
-    `, [
-      c.id, c.firstName || null, c.middleName || null, c.lastName || null, c.name || null,
-      c.mobile || c.phone || null, c.alternateMobile || null, c.reference || c.customerReference || null,
-      c.address || null, c.city || null, c.district || null, c.pincode || null, c.status || 'ACTIVE',
-      c.createdAt || now(), c.updatedAt || c.createdAt || now(), JSON.stringify(c)
-    ]);
-  }
-
-  for (const l of groups.loans) {
-    await client.query(`
-      INSERT INTO loans
-        (id, customer_id, khata_no, loan_type, loan_against, amount, rate, emi, emi_option, start_date, status, created_at, updated_at, data_json)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::jsonb)
-      ON CONFLICT (id) DO UPDATE SET
-        customer_id=EXCLUDED.customer_id, khata_no=EXCLUDED.khata_no, loan_type=EXCLUDED.loan_type,
-        loan_against=EXCLUDED.loan_against, amount=EXCLUDED.amount, rate=EXCLUDED.rate, emi=EXCLUDED.emi,
-        emi_option=EXCLUDED.emi_option, start_date=EXCLUDED.start_date, status=EXCLUDED.status,
-        created_at=EXCLUDED.created_at, updated_at=EXCLUDED.updated_at, data_json=EXCLUDED.data_json
-    `, [
-      l.id, l.customerId, l.khataNo || l.legacyKhataNo || null, l.loanType || null, l.loanAgainst || null,
-      Number(l.amount || 0), Number(l.interestRate ?? l.rate ?? 0), Number(l.emi || 0), l.emiOption || null,
-      l.startDate || null, l.status || 'ACTIVE', l.createdAt || now(), l.updatedAt || l.createdAt || now(), JSON.stringify(l)
-    ]);
-  }
-
-  for (const sc of groups.schedules) {
-    await client.query(`
-      INSERT INTO schedules
-        (id, loan_id, due_date, installment_no, emi, principal, interest, penalty, paid, remaining, status, manual_pending, pending_added_at, pending_added_by, data_json)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15::jsonb)
-      ON CONFLICT (id) DO UPDATE SET
-        loan_id=EXCLUDED.loan_id, due_date=EXCLUDED.due_date, installment_no=EXCLUDED.installment_no,
-        emi=EXCLUDED.emi, principal=EXCLUDED.principal, interest=EXCLUDED.interest, penalty=EXCLUDED.penalty,
-        paid=EXCLUDED.paid, remaining=EXCLUDED.remaining, status=EXCLUDED.status, manual_pending=EXCLUDED.manual_pending,
-        pending_added_at=EXCLUDED.pending_added_at, pending_added_by=EXCLUDED.pending_added_by, data_json=EXCLUDED.data_json
-    `, [
-      sc.id, sc.loanId, sc.dueDate || null, sc.installment ?? sc.installmentNo ?? null, Number(sc.emi || 0),
-      Number(sc.principal || 0), Number(sc.interest || 0), Number(sc.penalty || 0), Number(sc.paid || 0),
-      Number(sc.remaining || 0), sc.status || 'PENDING', Boolean(sc.manualPending), sc.pendingAddedAt || null,
-      sc.pendingAddedBy || null, JSON.stringify(sc)
-    ]);
-  }
-
-  for (const pay of groups.payments) {
-    if (paymentsTotalGenerated) {
-      await client.query(`
-        INSERT INTO payments
-          (id, loan_id, schedule_id, payment_date, principal, interest, penalty, mode, notes, created_at, activity_created_at, data_json)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
-        ON CONFLICT (id) DO UPDATE SET
-          loan_id=EXCLUDED.loan_id, schedule_id=EXCLUDED.schedule_id, payment_date=EXCLUDED.payment_date,
-          principal=EXCLUDED.principal, interest=EXCLUDED.interest, penalty=EXCLUDED.penalty,
-          mode=EXCLUDED.mode, notes=EXCLUDED.notes, created_at=EXCLUDED.created_at,
-          activity_created_at=EXCLUDED.activity_created_at, data_json=EXCLUDED.data_json
-      `, [
-        pay.id, pay.loanId, pay.scheduleId || null, pay.date || pay.paymentDate || null,
-        Number(pay.principal) || 0, Number(pay.interest) || 0, Number(pay.penalty) || 0,
-        pay.mode || null, pay.notes || null, pay.createdAt || now(),
-        pay.activityCreatedAt || pay.createdAt || now(), JSON.stringify(pay)
-      ]);
-    } else {
-      await client.query(`
-        INSERT INTO payments
-          (id, loan_id, schedule_id, payment_date, principal, interest, penalty, total, mode, notes, created_at, activity_created_at, data_json)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
-        ON CONFLICT (id) DO UPDATE SET
-          loan_id=EXCLUDED.loan_id, schedule_id=EXCLUDED.schedule_id, payment_date=EXCLUDED.payment_date,
-          principal=EXCLUDED.principal, interest=EXCLUDED.interest, penalty=EXCLUDED.penalty, total=EXCLUDED.total,
-          mode=EXCLUDED.mode, notes=EXCLUDED.notes, created_at=EXCLUDED.created_at,
-          activity_created_at=EXCLUDED.activity_created_at, data_json=EXCLUDED.data_json
-      `, [
-        pay.id, pay.loanId, pay.scheduleId || null, pay.date || pay.paymentDate || null,
-        Number(pay.principal) || 0, Number(pay.interest) || 0, Number(pay.penalty) || 0,
-        Number(pay.total) || 0, pay.mode || null, pay.notes || null, pay.createdAt || now(),
-        pay.activityCreatedAt || pay.createdAt || now(), JSON.stringify(pay)
-      ]);
-    }
-  }
-
-  if (replacePendingQueue) {
-    const pending = new Set((data.pendingQueue || []).map(String));
-    await client.query(`UPDATE schedules SET manual_pending = (id = ANY($1::text[]))`, [[...pending]]);
-    // Keep the JSON representation compatible with the existing frontend contract.
-    await client.query(`
-      UPDATE schedules
-      SET data_json = CASE
-        WHEN manual_pending THEN jsonb_set(COALESCE(data_json,'{}'::jsonb), '{manualPending}', 'true'::jsonb, true)
-        ELSE jsonb_set(COALESCE(data_json,'{}'::jsonb), '{manualPending}', 'false'::jsonb, true)
-      END
-    `);
-  }
+  for (const type of Object.keys(groups)) for (const record of groups[type]) await upsertNormalizedRow(client, type, record);
+  if (replacePending) await replacePendingQueue(client, data.pendingQueue || []);
 }
 
 async function userData(executor = db) {
@@ -2853,9 +2628,7 @@ async function api(req, res) {
       state: 'Maharashtra',
       taluka: String(incoming.taluka || ''),
       ownerId: u.id,
-      status: String(incoming.status || 'ACTIVE'),
       createdAt,
-      updatedAt: createdAt,
       activityCreatedAt: createdAt
     };
 

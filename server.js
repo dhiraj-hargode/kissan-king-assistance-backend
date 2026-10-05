@@ -251,34 +251,6 @@ async function initDb() {
     )
   `);
 
-  // Existing Render databases may have an older app_settings schema that
-  // stores the JSON document in data_json instead of settings. CREATE TABLE
-  // IF NOT EXISTS does not alter an existing table, so upgrade it in place.
-  // This keeps existing settings intact and avoids a deployment-time failure.
-  await db.query(`
-    ALTER TABLE app_settings
-      ADD COLUMN IF NOT EXISTS settings JSONB NOT NULL DEFAULT '{}'::jsonb
-  `);
-  await db.query(`
-    DO $$
-    BEGIN
-      IF EXISTS (
-        SELECT 1
-        FROM information_schema.columns
-        WHERE table_schema = 'public'
-          AND table_name = 'app_settings'
-          AND column_name = 'data_json'
-      ) THEN
-        EXECUTE $sql$
-          UPDATE app_settings
-          SET settings = COALESCE(data_json, '{}'::jsonb)
-          WHERE (settings IS NULL OR settings = '{}'::jsonb)
-            AND data_json IS NOT NULL
-        $sql$;
-      END IF;
-    END $$
-  `);
-
   await db.query(`
     CREATE TABLE IF NOT EXISTS app_backups (
       id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -364,6 +336,14 @@ async function initDb() {
       reason TEXT, expired_date DATE, notes TEXT, data_json JSONB NOT NULL DEFAULT '{}'::jsonb
     )
   `);
+
+  // Backward-compatible schema repair for databases created by older builds.
+  // CREATE TABLE IF NOT EXISTS does not add columns to an existing table.
+  // The normalized loader requires data_json on every business table.
+  for (const table of ['customers','loans','schedules','payments','blacklist','notifications','deleted_records','expired_customers']) {
+    await db.query(`ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS data_json JSONB NOT NULL DEFAULT '{}'::jsonb`);
+  }
+  await db.query(`ALTER TABLE app_settings ADD COLUMN IF NOT EXISTS settings JSONB NOT NULL DEFAULT '{}'::jsonb`);
 
   await db.query('CREATE INDEX IF NOT EXISTS idx_customers_name ON customers(name, first_name, last_name)');
   await db.query('CREATE INDEX IF NOT EXISTS idx_customers_mobile ON customers(mobile)');

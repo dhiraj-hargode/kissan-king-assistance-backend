@@ -345,8 +345,11 @@ async function initDb() {
   await db.query('CREATE INDEX IF NOT EXISTS idx_loans_status ON loans(status)');
   await db.query('CREATE INDEX IF NOT EXISTS idx_schedules_loan_id ON schedules(loan_id)');
   await db.query('CREATE INDEX IF NOT EXISTS idx_schedules_due_date ON schedules(due_date)');
+  await db.query('CREATE INDEX IF NOT EXISTS idx_schedules_pending_due ON schedules(due_date, id) WHERE manual_pending = TRUE AND pending_added_at IS NOT NULL');
+  await db.query('CREATE INDEX IF NOT EXISTS idx_schedules_pending_loan ON schedules(loan_id) WHERE manual_pending = TRUE AND pending_added_at IS NOT NULL');
   await db.query('CREATE INDEX IF NOT EXISTS idx_payments_loan_id ON payments(loan_id)');
   await db.query('CREATE INDEX IF NOT EXISTS idx_payments_schedule_id ON payments(schedule_id)');
+  await db.query('CREATE INDEX IF NOT EXISTS idx_payments_schedule_date ON payments(schedule_id, payment_date)');
   await db.query('CREATE INDEX IF NOT EXISTS idx_payments_date ON payments(payment_date)');
   await db.query('CREATE INDEX IF NOT EXISTS idx_blacklist_customer_id ON blacklist(customer_id)');
   await db.query('CREATE INDEX IF NOT EXISTS idx_expired_customers_customer_id ON expired_customers(customer_id)');
@@ -1926,6 +1929,7 @@ async function api(req, res) {
   if (method === 'GET' && parts[1] === 'collections' && parts[2] === 'pending') {
     const u = await sessionUser(req);
     if (!u) return send(res, 401, { error: 'Authentication required' });
+
     const url = new URL(req.url, 'http://localhost');
     const rawPage = Number.parseInt(url.searchParams.get('page') || '1', 10);
     const rawLimit = Number.parseInt(url.searchParams.get('limit') || '50', 10);
@@ -1933,54 +1937,126 @@ async function api(req, res) {
     const limit = Number.isFinite(rawLimit) ? Math.min(100, Math.max(1, rawLimit)) : 50;
     const search = String(url.searchParams.get('search') || '').trim().toLowerCase().slice(0, 100);
     const asOf = isoDateFromQuery(url.searchParams.get('date'));
-    const d = await userData();
-    const customers = Array.isArray(d.customers) ? d.customers : [];
-    const loans = Array.isArray(d.loans) ? d.loans : [];
-    const schedules = Array.isArray(d.schedules) ? d.schedules : [];
-    const payments = Array.isArray(d.payments) ? d.payments : [];
-    const expired = new Set((Array.isArray(d.expiredCustomers) ? d.expiredCustomers : []).map(x => String(x?.customerId || x?.id || '')));
-    const pendingIds = new Set((Array.isArray(d.pendingQueue) ? d.pendingQueue : []).map(String));
-    const customerById = new Map(customers.map(c => [String(c.id), c]));
-    const loanById = new Map(loans.map(l => [String(l.id), l]));
-    const totals = new Map();
-    for (const p of payments) {
-      const sid = String(p?.scheduleId || '').trim();
-      if (!sid) continue;
-      const x = totals.get(sid) || { principalInterest: 0, penalty: 0 };
-      x.principalInterest += Number(p?.principal || 0) + Number(p?.interest || 0);
-      x.penalty += Number(p?.penalty || 0);
-      totals.set(sid, x);
-    }
-    const due = s => {
-      const t = totals.get(String(s?.id)) || { principalInterest: 0, penalty: 0 };
-      return Number((Math.max(0, Number(s?.emi || 0) - Math.max(Number(s?.paid || 0), t.principalInterest)) + Math.max(0, Number(s?.penalty || 0) - t.penalty)).toFixed(2));
-    };
-    const rows = [];
-    for (const s of schedules) {
-      if (!pendingIds.has(String(s?.id)) || !s?.pendingAddedAt) continue;
-      const l = loanById.get(String(s?.loanId || ''));
-      if (!l || expired.has(String(l.customerId))) continue;
-      const c = customerById.get(String(l.customerId)) || null;
-      const pending = due(s);
-      if (pending <= 0.005 || String(l.status || '').toUpperCase() === 'CLOSED') continue;
-      const status = String(s.dueDate) < asOf ? 'OVERDUE' : String(s.dueDate) === asOf ? 'DUE TODAY' : 'UPCOMING';
-      const khata = l?.legacyKhataNo || l?.khataNo || l?.id || '-';
-      const haystack = [c?.firstName, c?.middleName, c?.lastName, c?.mobile, c?.id, khata, l?.id, status].filter(Boolean).join(' ').toLowerCase();
-      if (search && !haystack.includes(search)) continue;
-      rows.push({ schedule: s, loan: l, customer: c, pending, status, daysLate: Math.max(0, Math.floor((new Date(asOf + 'T00:00:00') - new Date(String(s.dueDate) + 'T00:00:00')) / 86400000)) });
-    }
-    rows.sort((a, b) => String(b.schedule?.dueDate || '').localeCompare(String(a.schedule?.dueDate || '')));
-    const total = rows.length;
+    const offset = (page - 1) * limit;
+
+    // Pending Payments is a database queue. Read only pending schedules and
+    // aggregate payments for those schedules; never load the full database.
+    const result = await db.query(`
+      WITH pending AS (
+        SELECT
+          s.id,
+          s.loan_id,
+          s.due_date,
+          s.data_json AS schedule_json,
+          l.data_json AS loan_json,
+          l.status AS loan_status,
+          l.customer_id,
+          c.data_json AS customer_json,
+          COALESCE(SUM(p.principal + p.interest), 0)::numeric AS paid_principal_interest,
+          COALESCE(SUM(p.penalty), 0)::numeric AS paid_penalty
+        FROM schedules s
+        JOIN loans l ON l.id = s.loan_id
+        JOIN customers c ON c.id = l.customer_id
+        LEFT JOIN payments p ON p.schedule_id = s.id
+        WHERE s.manual_pending = TRUE
+          AND s.pending_added_at IS NOT NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM expired_customers e WHERE e.customer_id = l.customer_id
+          )
+        GROUP BY s.id, l.id, c.id
+      ),
+      calculated AS (
+        SELECT
+          *,
+          ROUND((
+            GREATEST(0, COALESCE((schedule_json->>'emi')::numeric, 0)
+              - GREATEST(COALESCE((schedule_json->>'paid')::numeric, 0), paid_principal_interest))
+            + GREATEST(0, COALESCE((schedule_json->>'penalty')::numeric, 0) - paid_penalty)
+          ), 2) AS pending_amount
+        FROM pending
+      ),
+      filtered AS (
+        SELECT
+          *,
+          CASE
+            WHEN due_date < $1::date THEN 'OVERDUE'
+            WHEN due_date = $1::date THEN 'DUE TODAY'
+            ELSE 'UPCOMING'
+          END AS collection_status
+        FROM calculated
+        WHERE pending_amount > 0.005
+          AND UPPER(COALESCE(loan_status, '')) <> 'CLOSED'
+          AND (
+            $2 = '' OR
+            LOWER(CONCAT_WS(' ',
+              customer_json->>'firstName', customer_json->>'middleName', customer_json->>'lastName',
+              customer_json->>'mobile', customer_json->>'id',
+              loan_json->>'khataNo', loan_json->>'legacyKhataNo', loan_json->>'id'
+            )) LIKE '%' || $2 || '%'
+          )
+      ),
+      summary AS (
+        SELECT
+          COUNT(*)::int AS total_count,
+          COALESCE(SUM(pending_amount), 0)::numeric AS total_pending,
+          COUNT(*) FILTER (WHERE collection_status = 'OVERDUE')::int AS overdue_emis,
+          COUNT(DISTINCT loan_id) FILTER (WHERE collection_status = 'OVERDUE')::int AS overdue_loans,
+          COALESCE(SUM(pending_amount) FILTER (WHERE collection_status = 'DUE TODAY'), 0)::numeric AS due_today
+        FROM filtered
+      ),
+      page_rows AS (
+        SELECT *
+        FROM filtered
+        ORDER BY due_date DESC NULLS LAST, id DESC
+        LIMIT $3 OFFSET $4
+      )
+      SELECT p.*, s.total_count, s.total_pending, s.overdue_emis, s.overdue_loans, s.due_today
+      FROM summary s
+      LEFT JOIN page_rows p ON TRUE
+      ORDER BY p.due_date DESC NULLS LAST, p.id DESC
+    `, [asOf, search, limit, offset]);
+
+    const total = Number(result.rows[0]?.total_count || 0);
     const totalPages = Math.max(1, Math.ceil(total / limit));
     const safePage = Math.min(page, totalPages);
-    const start = (safePage - 1) * limit;
-    const data = rows.slice(start, start + limit);
-    const overdue = rows.filter(r => r.status === 'OVERDUE');
-    const dueToday = rows.filter(r => r.status === 'DUE TODAY');
+
+    const rows = result.rows.filter(r => r.id != null).map(r => {
+      const schedule = {
+        ...(r.schedule_json || {}),
+        manualPending: true
+      };
+      const loan = r.loan_json || {};
+      const customer = r.customer_json || null;
+      const daysLate = Math.max(0, Math.floor(
+        (new Date(asOf + 'T00:00:00') - new Date(String(r.due_date) + 'T00:00:00')) / 86400000
+      ));
+      return {
+        schedule,
+        loan,
+        customer,
+        pending: Number(r.pending_amount),
+        status: r.collection_status,
+        daysLate
+      };
+    });
+
+    const first = result.rows[0];
     return send(res, 200, {
-      rows: data,
-      summary: { totalPending: rows.reduce((sum, r) => sum + r.pending, 0), overdueLoans: new Set(overdue.map(r => r.loan.id)).size, overdueEmis: overdue.length, dueToday: dueToday.reduce((sum, r) => sum + r.pending, 0) },
-      pagination: { page: safePage, limit, total, totalPages, hasNext: safePage < totalPages, hasPrevious: safePage > 1 },
+      rows,
+      summary: {
+        totalPending: Number(first?.total_pending || 0),
+        overdueLoans: Number(first?.overdue_loans || 0),
+        overdueEmis: Number(first?.overdue_emis || 0),
+        dueToday: Number(first?.due_today || 0)
+      },
+      pagination: {
+        page: safePage,
+        limit,
+        total,
+        totalPages,
+        hasNext: safePage < totalPages,
+        hasPrevious: safePage > 1
+      },
       user: u
     });
   }
@@ -2734,8 +2810,6 @@ async function api(req, res) {
     const client = await db.connect();
     try {
       await client.query('BEGIN');
-      await client.query(`SELECT pg_advisory_xact_lock(hashtext('loan-management-shared-data'))`);
-
       const scheduleResult = await client.query(`
         SELECT id, loan_id, due_date, emi, paid, penalty, manual_pending,
                pending_added_at, pending_added_by, data_json
